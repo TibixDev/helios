@@ -30,7 +30,8 @@ use helios_protocol::{
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
-    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_MAP_CACHE_MASK,
+    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+    VIRTIO_GPU_MAP_CACHE_MASK,
     VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::queue::VirtQueue;
@@ -467,6 +468,7 @@ impl VirtioGpu {
         &mut self,
         ctx_id: u32,
         fence_id: u64,
+        ring_idx: u32,
         venus: &[u8],
     ) -> Result<(), VirtioError> {
         if venus.is_empty() {
@@ -477,6 +479,15 @@ impl VirtioGpu {
         cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
         cmd.hdr.fence_id = fence_id;
         cmd.hdr.ctx_id = ctx_id;
+        // Route the fence to this queue's venus host timeline. ring_idx 0 is the
+        // CPU/primary ring (global fence is fine); a queue is bound to ring_idx>0
+        // and the host must create the fence on that context+ring timeline
+        // (QEMU virgl_renderer_context_create_fence) for venus's per-queue waits
+        // (vkQueueWaitIdle) to complete. Mirrors the virtgpu EXECBUF ring_idx.
+        if ring_idx > 0 {
+            cmd.hdr.flags |= VIRTIO_GPU_FLAG_INFO_RING_IDX;
+            cmd.hdr.ring_idx = ring_idx as u8;
+        }
         cmd.size = venus.len() as u32;
 
         let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();

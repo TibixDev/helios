@@ -61,7 +61,14 @@ impl HeliosEscapeHeader {
 }
 
 /// `HELIOS_ESCAPE_SUBMIT_VENUS` — followed by `buffer_size` bytes of Venus
-/// command stream. 32 bytes (header included).
+/// command stream. 40 bytes (header included).
+///
+/// `ring_idx` is the venus per-queue host timeline this submission targets (0 =
+/// the CPU/primary ring). The KMD forwards it as `VIRTIO_GPU_FLAG_INFO_RING_IDX`
+/// + `ctrl_hdr.ring_idx` on the SUBMIT_3D so the host routes the fence to the
+/// matching context+ring timeline (`virgl_renderer_context_create_fence`) — which
+/// is what venus waits on for a queue (vkQueueWaitIdle). Without it the host
+/// signals only the global fence and the per-queue wait never completes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeSubmitVenus {
@@ -69,6 +76,8 @@ pub struct HeliosEscapeSubmitVenus {
     pub fence_id: u64,
     pub ctx_id: u32,
     pub buffer_size: u32,
+    pub ring_idx: u32,
+    pub _pad: u32,
 }
 
 /// `HELIOS_ESCAPE_CTX_CREATE`. The KMD fills `out_ctx_id` with the guest-assigned
@@ -133,7 +142,7 @@ pub struct HeliosEscapeWaitFence {
 
 const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
-    assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 32);
+    assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 40);
     assert!(core::mem::size_of::<HeliosEscapeCtxCreate>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);

@@ -241,8 +241,10 @@ unsafe fn handle_submit_venus(adapter: &AdapterContext, request: WDFREQUEST) -> 
     dma.as_mut_slice()
         .copy_from_slice(slice::from_raw_parts(venus_ptr, payload));
 
-    let (ctx_id, fence_id) = (req.ctx_id, req.fence_id);
-    let status = match adapter.with_virtio(|v| v.submit_venus(ctx_id, fence_id, dma.as_slice())) {
+    let (ctx_id, fence_id, ring_idx) = (req.ctx_id, req.fence_id, req.ring_idx);
+    let status = match adapter
+        .with_virtio(|v| v.submit_venus(ctx_id, fence_id, ring_idx, dma.as_slice()))
+    {
         Ok(Ok(())) => STATUS_SUCCESS,
         Ok(Err(ve)) => ve.into(),
         Err(de) => de.into(),
