@@ -25,8 +25,9 @@ use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
-    VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob, VirtioGpuRespDisplayInfo,
-    VirtioGpuRespMapInfo, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+    VirtioGpuCtxResource, VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob,
+    VirtioGpuRespDisplayInfo, VirtioGpuRespMapInfo, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_MAP_CACHE_MASK,
@@ -435,8 +436,22 @@ impl VirtioGpu {
         cmd.blob_id = blob_id;
         cmd.size = size;
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
-        // Record only after the host accepted the create (so a failed create
-        // doesn't occupy a slot). Done under the caller's spinlock — alloc-free.
+
+        // Attach the blob resource to its 3D context. The Linux virtio-gpu kernel
+        // driver issues VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE for every context
+        // resource right after creating it (confirmed by ftrace of a working venus
+        // guest: create_blob -> map -> ctx_attach_resource). Without it the host's
+        // venus context never binds the resource, so a subsequent RESOURCE_MAP_BLOB
+        // (and venus ring use) fails with "resource does not exist". The resource id
+        // namespace is per-context for venus, so the attach is required before map.
+        let mut attach = VirtioGpuCtxResource::zeroed();
+        attach.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+        attach.hdr.ctx_id = ctx_id;
+        attach.resource_id = resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&attach))?;
+
+        // Record only after the host accepted the create + attach (so a failed
+        // create doesn't occupy a slot). Done under the caller's spinlock — alloc-free.
         self.blobs.insert(resource_id, size)?;
         Ok(resource_id)
     }

@@ -11,3 +11,10 @@ crate-type = ["lib"]
 [dependencies]
 # bytemuck is no_std by default; `derive` works without std.
 bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Authoritative virtio-gpu constants (generated from the Linux uapi headers).
+# Dev-dep only: the crate is std (bindgen `::std::os::raw`), so it cannot go in
+# the no_std build — instead the `virtio_gpu::tests` module pins our hand-defined
+# wire constants to it, so `cargo test` fails if they ever drift.
+virtio-bindings = "0.2.7"

@@ -27,6 +27,7 @@ name = "helios_protocol"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "virtio-bindings",
 ]
 
 [[package]]
@@ -63,3 +64,9 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "virtio-bindings"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
