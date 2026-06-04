@@ -46,10 +46,17 @@ const SSH_HOST: &str = "win";
 const MESA_SRC: &str = "Z:\\icd\\mesa";
 /// Local build dir for the Mesa venus ICD (ninja writes artifacts to local disk).
 const MESA_BUILD: &str = "C:\\Users\\Rupansh\\helios-mesa-build";
-/// VS 2022 x64 dev environment — puts cl/link + the WDK/SDK INCLUDE/LIB on the
-/// environment that meson's compiler detection and cc.find_library('setupapi') need.
+/// VS 2022 x64 dev environment (vcvars). Kept for the clang-cl ALTERNATIVE
+/// toolchain (icd/win-build/clang-cl-native.ini), which needs the MSVC SDK libs;
+/// the recommended mingw build does not use it. Drive clang-cl manually via
+/// win_exec if needed.
+#[allow(dead_code)]
 const VCVARS: &str =
     "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat";
+/// mingw-w64 (WinLibs UCRT gcc 16.1) bin dir — the RECOMMENDED venus toolchain
+/// (icd/win-build/mingw-native.ini). gcc compiles venus's GNU-isms natively and
+/// builds straight from Z:\. Installed via `winget install BrechtSanders.WinLibs.POSIX.UCRT`.
+const MINGW_BIN: &str = "C:\\Users\\Rupansh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\\mingw64\\bin";
 
 #[derive(Clone)]
 pub struct WinHost {
@@ -268,7 +275,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Build the Mesa venus Vulkan ICD on win11 by running meson under the VS 2022 x64 dev environment (so cl/link + the WDK/SDK are on INCLUDE/LIB). Mesa is read straight from the Z:\\ share at Z:\\icd\\mesa and built into the LOCAL dir C:\\Users\\Rupansh\\helios-mesa-build — the 9p share is fine for the compiler's reads (validated: meson configures + cl compiles ~187 objects from Z:\\), so NO robocopy mirror is needed; only ninja's writes go to local disk. `args` is the meson argv: e.g. [\"setup\", \"C:\\\\Users\\\\Rupansh\\\\helios-mesa-build\", \"Z:\\\\icd\\\\mesa\", \"-Dvulkan-drivers=virtio\", ...] to configure, or [\"compile\", \"-C\", \"C:\\\\Users\\\\Rupansh\\\\helios-mesa-build\"] to build; empty args defaults to compiling the standard build dir. NOTE: venus needs MSVC-portability work (/experimental:c11atomics + void*-arithmetic fixes + pid_t/gettid) and a vn_renderer_helios.c backend before it links — see icd/PHASE5_HANDOVER.md."
+        description = "Build the Mesa venus Vulkan ICD on win11 with the RECOMMENDED mingw-w64 gcc toolchain. Mesa is read straight from the Z:\\ share at Z:\\icd\\mesa and built into the LOCAL dir C:\\Users\\Rupansh\\helios-mesa-build (validated: gcc compiles 100% of venus from Z:\\ to link, zero Mesa edits). `args` is the meson argv. To CONFIGURE, pass the native file + the compat forced-include + the option set, e.g.: [\"setup\",\"C:\\\\Users\\\\Rupansh\\\\helios-mesa-build\",\"Z:\\\\icd\\\\mesa\",\"--native-file\",\"Z:\\\\icd\\\\win-build\\\\mingw-native.ini\",\"-Dc_args=-includeZ:\\\\icd\\\\win-build\\\\helios_win_compat.h\",\"-Dvulkan-drivers=virtio\",\"-Dgallium-drivers=\",\"-Dplatforms=windows\",\"-Dvideo-codecs=\",\"-Dvulkan-layers=\",\"-Degl=disabled\",\"-Dgbm=disabled\",\"-Dglx=disabled\",\"-Dopengl=false\",\"-Dgles1=disabled\",\"-Dgles2=disabled\",\"-Dllvm=disabled\",\"-Dshader-cache=disabled\",\"-Dbuild-tests=false\",\"-Dperfetto=false\",\"--buildtype=debugoptimized\"]. To BUILD, [\"compile\",\"-C\",\"C:\\\\Users\\\\Rupansh\\\\helios-mesa-build\"]; empty args defaults to compiling that dir. The mingw bin is prepended to PATH; no vcvars (mingw is self-contained). The clang-cl alternative (icd/win-build/clang-cl-native.ini) needs a local C: source mirror — drive it via win_exec. See icd/PHASE5_HANDOVER.md §6."
     )]
     async fn win_meson(&self, Parameters(a): Parameters<WinMesonArgs>) -> String {
         // Default to compiling the standard Mesa ICD build dir.
@@ -277,13 +284,14 @@ impl WinHost {
         } else {
             a.args.join(" ")
         };
-        // Run meson inside the VS dev environment so cl/link + the SDK/WDK are
-        // found. vcvars prepends the VS paths but preserves the existing PATH (which
-        // already has meson/ninja in Python's Scripts dir). No robocopy: meson reads
-        // Mesa source from Z:\ (MESA_SRC) directly; ninja artifacts land in the local
-        // C: build dir. `%PATH%` is left for cmd to expand at runtime.
+        // Recommended toolchain = mingw-w64 gcc: prepend its bin to PATH so gcc +
+        // its helpers resolve (the --native-file the caller passes pins the actual
+        // compilers). No vcvars — mingw ships its own Windows headers/libs and gcc
+        // ignores the MSVC INCLUDE/LIB env. meson reads Mesa source from Z:\ directly
+        // (no robocopy); ninja artifacts go to the local C: build dir. cmd expands
+        // %PATH% at parse time, which is correct here (single prepend, no prior env mutation).
         let command =
-            format!("cmd /c '\"{VCVARS}\" >nul 2>&1 && meson {meson_args}'");
+            format!("cmd /c 'set \"PATH={MINGW_BIN};%PATH%\" && meson {meson_args}'");
         match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(1800)).await {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),

@@ -224,31 +224,49 @@ then `win_meson([])` (defaults to `compile -C` the build dir).
 4. No Rust/bindgen (venus is pure C with this option set). ✅
 `meson setup` returns 0 cleanly.
 
-### 6.5 ⚠️ venus MSVC-portability gap (the real first task, NOT a share/IO problem)
+### 6.5 ✅ venus compiles on Windows — SOLVED (validated 2026-06-05)
 
-venus has **never** been compiled on Windows (vtest excluded, virtgpu Linux-only), so `cl` hits genuine
-GCC-isms once it reaches `src/virtio/vulkan/*.c`:
-1. **C11 atomics**: `vcruntime_c11_stdatomic.h: #error "C atomic support is not enabled"` — needs
-   `/experimental:c11atomics` in the venus C args (MSVC) — i.e. a `meson.build` `vn_c_args` addition.
-2. **`void*` pointer arithmetic** (`C2036 'void*': unknown size`) — pervasive in `vn_cs.h`, `vn_ring.h`,
-   `vn_common.h`, **and the generated `src/virtio/venus-protocol/vn_protocol_driver_*.h`** + `vn_command_buffer.c`.
-   GCC/clang treat `sizeof(void)==1`; MSVC rejects it. This is the hard one (it's in generated headers).
-3. **`pid_t` / `gettid`** in `vn_common.c` (`vn_gettid`) — Linux types; need a Win32 shim
-   (`GetCurrentThreadId`).
+venus had never been built on Windows (vtest excluded, virtgpu Linux-only). MSVC `cl` fails on venus's
+GNU-isms (C11 atomics need `/experimental:c11atomics`; `void*` pointer arithmetic → `C2036` all over
+`vn_cs.h`/`vn_ring.h` + the *generated* `venus-protocol/vn_protocol_driver_*.h`; `pid_t`). **gcc and clang
+accept all of those natively** (`void*` arithmetic + C11 `_Atomic` are GNU extensions), so the fix is the
+toolchain, not patching venus. **Both mingw-w64 gcc 16.1 and clang-cl 17 compile 100% of venus (every
+`vn_*.c` + the generated protocol headers) with ZERO edits to the Mesa tree**, reaching the link step
+(only the expected undefineds remain: `vn_renderer_create_vtest` = the unwritten backend, and the
+SPIR-V→NIR `vtn_*` from `vk_util.c`).
 
-**Two ways forward (decide early — this gates everything):**
-- **(A) clang-cl** (LLVM is installed) accepts the `void*` arithmetic + GCC-isms, the natural fix and
-  what mesa-on-Windows generally uses. BUT a first attempt tripped on the **zlib subproject**
-  (`deflate.c: #include nested too deeply`) and `llvm-rc` on `zlib1.rc` — clang-cl needs extra setup
-  (force zlib to the system/again, or `-Db_pch`/include tweaks, or build zlib with cl while venus uses
-  clang-cl). Not a drop-in; budget time to get clang-cl configured cleanly.
-- **(B) Stay on cl + patch venus**: add `/experimental:c11atomics`, then cast every `void*` arithmetic
-  to `char*` (incl. fixing the encoder generator `src/virtio/venus-protocol/` or its `.py` so the
-  generated headers are MSVC-clean) and shim `pid_t`/`gettid`. Larger, touches generated code, but keeps
-  one toolchain. Some of this may be upstreamable.
+The only out-of-tree glue is **one force-included header, `icd/win-build/helios_win_compat.h`** (NOT in
+the Mesa submodule), providing `pid_t`, the clang-cl interlocked-intrinsic aliases, and the
+`sync_wait`/`sync_valid_fd` libsync stubs — each block self-gating. (The sync stubs are PLACEHOLDERS for
+the IOCTL `WAIT_FENCE` path the backend will add.)
 
-Either way this is real work and should be the **first** Phase 5 task — `vn_renderer_helios.c` can't link
-until venus compiles. (The KMD/IOCTL side is done and waiting.)
+**RECOMMENDED: mingw-w64 gcc** (`icd/win-build/mingw-native.ini`). Why it beats clang-cl:
+- Builds **straight from `Z:\`** (no robocopy) — matches `win_meson`. clang-cl must build from a **local
+  C: source mirror** (clang's `#include`-once dedup needs stable inode identity the 9p share lacks → the
+  earlier `#include nested too deeply` on zlib was *this*, not a zlib/venus bug).
+- **One** forced-include (gcc has pid_t/atomics/interlocked natively); clang-cl additionally needs
+  `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` (MSVC 14.44 STL gates Clang≥19) + the SDK `rc.exe` pinned
+  (not `llvm-rc`). Two of clang-cl's needs retire only by moving to LLVM≥19.
+- Install (done on win11): `winget install --id BrechtSanders.WinLibs.POSIX.UCRT --exact` → gcc 16.1.0,
+  native Windows target (`x86_64-w64-mingw32`), bundles pkgconf/ninja/widl/dlltool/windres.
+
+**Build (mingw) — via the `win_meson` MCP tool (configured for mingw + the shim):**
+```
+win_meson(["setup","C:\\Users\\Rupansh\\helios-mesa-build","Z:\\icd\\mesa",
+  "--native-file","Z:\\icd\\win-build\\mingw-native.ini",
+  "-Dc_args=-includeZ:\\icd\\win-build\\helios_win_compat.h", <the §6.4 option set>])
+win_meson([])   # compile
+```
+The configure gates from §6.4 still apply (mako/pyyaml/packaging/setuptools; CMake builds DirectX-Headers
++ zlib from wraps). **Deployment note (mingw):** static-link the runtime
+(`-static-libgcc -static-libstdc++ -Wl,-Bstatic,-lwinpthread`) so `vulkan_virtio.dll` has no mingw-runtime
+DLL deps; the Vulkan loader then loads it like any ICD (the exported `vk_icd*` symbols are the C ABI,
+toolchain-agnostic — DXVK/VKD3D in Phase 6 are unaffected). clang-cl alternative: `icd/win-build/clang-cl-native.ini`.
+
+So the venus-compile blocker is **closed**; the genuine remaining Phase 5 work is writing
+`vn_renderer_helios.c` (defines `vn_renderer_create`, replacing the vtest backend symbol) and resolving
+the `vtn_*` SPIR-V→NIR link dep (link libvtn, or confirm the IOCTL transport path doesn't need
+`vk_spec_info_to_nir_spirv`). The KMD/IOCTL side is done and waiting.
 
 ---
 
