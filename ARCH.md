@@ -27,18 +27,20 @@ Helios is a **System-class KMDF function driver** for the virtio-gpu PCI device 
 
 ## 3. IOCTL Protocol
 
-`CTL_CODE(DeviceType, Function, Method, Access) = (DeviceType<<16)|(Access<<14)|(Function<<2)|Method`. DeviceType = `FILE_DEVICE_UNKNOWN` (0x22), Access = `FILE_ANY_ACCESS` (0), Function base 0x900 (>=0x800 vendor range). Methods: BUFFERED=0, IN_DIRECT=1, OUT_DIRECT=2, NEITHER=3.
+`CTL_CODE(DeviceType, Function, Method, Access) = (DeviceType<<16)|(Access<<14)|(Function<<2)|Method`. DeviceType = `FILE_DEVICE_UNKNOWN` (0x22), Access = `FILE_READ_DATA|FILE_WRITE_DATA` (0b11 = 3), Function base 0x900 (>=0x800 vendor range). Methods: BUFFERED=0, IN_DIRECT=1, OUT_DIRECT=2, NEITHER=3. The single source of truth for these values is `protocol/src/ioctl.rs` (the constants there are asserted at compile time).
+
+**RequiredAccess = read+write, not FILE_ANY_ACCESS:** every op transfers data and is a privileged GPU operation, so the codes specify `FILE_READ_DATA|FILE_WRITE_DATA` per the WDK "Security Issues for I/O Control Codes" guidance (the I/O manager then refuses the IOCTL on a handle lacking that access; the ICD opens with `GENERIC_READ|GENERIC_WRITE`). This puts `0b11` in the Access bits (14–15), so the codes are `0x0022_E4xx` (not the `0x0022_24xx` an Access=0 would give).
 
 | Op | IOCTL constant | Value | Method | In buffer | Out buffer |
 |----|----------------|-------|--------|-----------|-----------|
-| CTX_CREATE | IOCTL_HELIOS_CTX_CREATE | 0x00222400 | BUFFERED | HeliosCtxCreate (capset_id) | HeliosCtxCreate (out_ctx_id) |
-| CTX_DESTROY | IOCTL_HELIOS_CTX_DESTROY | 0x00222404 | BUFFERED | HeliosCtxDestroy | — |
-| SUBMIT_VENUS | IOCTL_HELIOS_SUBMIT_VENUS | 0x00222409 | IN_DIRECT | small header (ctx_id/fence_id/buffer_size) buffered + Venus blob via MDL | — |
-| ALLOC_BLOB | IOCTL_HELIOS_ALLOC_BLOB | 0x0022240C | BUFFERED | HeliosAllocBlob (size/flags/mem/ctx) | HeliosAllocBlob (out_resource_id) |
-| MAP_BLOB | IOCTL_HELIOS_MAP_BLOB | 0x00222412 | OUT_DIRECT | HeliosMapBlob (resource_id) | HeliosMapBlob (out_user_va) |
-| WAIT_FENCE | IOCTL_HELIOS_WAIT_FENCE | 0x00222414 | BUFFERED | HeliosWaitFence (fence_id/timeout_ns) | — |
+| CTX_CREATE | IOCTL_HELIOS_CTX_CREATE | 0x0022E400 | BUFFERED | HeliosCtxCreate (capset_id) | HeliosCtxCreate (out_ctx_id) |
+| CTX_DESTROY | IOCTL_HELIOS_CTX_DESTROY | 0x0022E404 | BUFFERED | HeliosCtxDestroy | — |
+| SUBMIT_VENUS | IOCTL_HELIOS_SUBMIT_VENUS | 0x0022E409 | IN_DIRECT | small header (ctx_id/fence_id/buffer_size) buffered + Venus blob via MDL | — |
+| ALLOC_BLOB | IOCTL_HELIOS_ALLOC_BLOB | 0x0022E40C | BUFFERED | HeliosAllocBlob (size/flags/mem/ctx) | HeliosAllocBlob (out_resource_id) |
+| MAP_BLOB | IOCTL_HELIOS_MAP_BLOB | 0x0022E412 | OUT_DIRECT | HeliosMapBlob (resource_id) | HeliosMapBlob (out_user_va) |
+| WAIT_FENCE | IOCTL_HELIOS_WAIT_FENCE | 0x0022E414 | BUFFERED | HeliosWaitFence (fence_id/timeout_ns) | — |
 
-(Function-code base = 0x220000 | (fn<<2); functions 0x900–0x905; + method 0/1/2/3.)
+(Each value = `(0x22<<16) | (3<<14) | (fn<<2) | method`; functions 0x900–0x905; method 0/1/2/3.)
 
 **Method rationale:** small fixed verbs use METHOD_BUFFERED (the I/O manager double-buffers; this is what mvisor's control.c uses). SUBMIT_VENUS's Venus stream can be megabytes, so METHOD_IN_DIRECT carries the variable payload via a locked MDL (`WdfRequestRetrieveInputWdmMdl`) while a small fixed header rides the buffered system buffer. MAP_BLOB returns a **user VA**, not a GPA: the kernel does `MmMapLockedPagesSpecifyCache(blobMdl, UserMode, <cache>)` and writes the resulting user VA into the OUT buffer — the page mapping is the side effect, the IOCTL only carries the 8-byte pointer. **Rename `HeliosEscapeMapBlob.out_gpa` → `out_user_va`** to reflect this.
 
@@ -155,3 +157,11 @@ umd/                DELETE
 - **SUBMIT_VENUS payload:** METHOD_IN_DIRECT delivers a locked MDL; v2 leans on keeping the proven PASSIVE-level copy into a contiguous `DmaBuffer` (vs zero-copy from a fragmented user MDL) — perf tradeoff to revisit.
 - **DXVK LUID interop (Phase 6):** confirm DXVK degrades gracefully when `D3DKMTOpenAdapterFromLuid` finds no WDDM adapter for the venus-reported LUID.
 - **`escape.rs` naming:** the module/types are still `HeliosEscape*`; byte layout is unchanged. Decide rename (cleaner, wide churn) vs keep-with-note.
+
+## 13. STATUS (2026-06-04) — Phase 0/1 DONE; Phase 3 IOCTL channel LIVE
+
+**DONE + committed (`7a5763f`):** Phases 0+1. The System-class KMDF driver builds, packages (infverif VALID, test-signed), force-installs over the inbox `VioGpuDod` (via `devcon update … "PCI\VEN_1AF4&DEV_1050"`), and **loads cleanly: device Code 0 / System class, `GUID_DEVINTERFACE_HELIOS` opens from user mode, and `VirtioGpu::init` round-trips `GET_DISPLAY_INFO`** (transport works). New module layout per §11. Detail: the `pivot-phase01-done` memory.
+
+**✅ RESOLVED (Phase 3 IOCTL dispatch — uncommitted WIP in the working tree):** every `DeviceIoControl` used to pend forever; root cause was a hand-rolled-`_INIT` bug, **not** queue config. `wdf::io_queue_config` builds `WDF_IO_QUEUE_CONFIG` but the Rust replica of `WDF_IO_QUEUE_CONFIG_INIT` omitted `Settings.Parallel.NumberOfPresentedRequests`, so `..Default::default()` left it **0**. The real FORCEINLINE macro sets it to `(ULONG)-1` (unlimited) for a parallel queue; WDF's dispatch gate is `if (DriverIoCount < NumberOfPresentedRequests) present()`, so 0 means the queue accepts requests but presents **zero** to the driver → `EvtIoDeviceControl` never fires. **Fix:** `cfg.Settings.Parallel.NumberOfPresentedRequests = ULONG::MAX;` (kmd/src/wdf.rs). **Verified:** `helios_probe.exe` PASSES end-to-end — `IOCTL_HELIOS_CTX_CREATE` returns `out_ctx_id=1` (a real host venus context), `IOCTL_HELIOS_CTX_DESTROY` succeeds; the `diag.rs` breadcrumb now reaches stage 11 (was frozen at 6). The whole earlier "ruled-out list" (default/non-default queue, power-managed/not, `WdfDeviceConfigureRequestDispatching`, IoType, ExecutionLevel, RequiredAccess) was a dead end because every variant reused the same builder and so kept `NumberOfPresentedRequests=0`. The earlier interrupt-connect `STATUS_DEVICE_POWER_FAILURE` was unrelated (a real separate Phase-4 item). Full record: the `pivot-phase3-ioctl-blocker` memory.
+
+**NEXT:** wire a real Venus stream through `IOCTL_HELIOS_SUBMIT_VENUS` (gated on virglrenderer `VIRGL_DEBUG=venus` logging `vkCreateInstance`), then the Mesa-venus ICD (§5). Phase 4: `SHARED_MEMORY_CFG` cap scan + `ALLOC_BLOB`/`MAP_BLOB` (§6), and the WDFINTERRUPT + async-fence DPC (resolve the `STATUS_DEVICE_POWER_FAILURE` interrupt-resource question then).

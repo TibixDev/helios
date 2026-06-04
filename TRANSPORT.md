@@ -291,21 +291,21 @@ CTL_CODE(DeviceType, Function, Method, Access)
     = (DeviceType<<16) | (Access<<14) | (Function<<2) | Method
 ```
 
-with `DeviceType = FILE_DEVICE_UNKNOWN (0x22)`, `Access = FILE_ANY_ACCESS (0)`, function base `0x900` (vendor range ≥ 0x800). Methods: `METHOD_BUFFERED=0`, `METHOD_IN_DIRECT=1`, `METHOD_OUT_DIRECT=2`, `METHOD_NEITHER=3`.
+with `DeviceType = FILE_DEVICE_UNKNOWN (0x22)`, `Access = FILE_READ_DATA|FILE_WRITE_DATA (3)`, function base `0x900` (vendor range ≥ 0x800). Methods: `METHOD_BUFFERED=0`, `METHOD_IN_DIRECT=1`, `METHOD_OUT_DIRECT=2`, `METHOD_NEITHER=3`. (`protocol/src/ioctl.rs` is the asserted source of truth.)
 
 ```rust
-// Shared between ICD and KMD (protocol/src/escape.rs is the source of truth).
+// Shared between ICD and KMD (protocol/src/ioctl.rs is the source of truth).
 const fn ctl_code(function: u32, method: u32) -> u32 {
-    // FILE_DEVICE_UNKNOWN << 16 | FILE_ANY_ACCESS << 14 | function << 2 | method
-    (0x22 << 16) | (0 << 14) | (function << 2) | method
+    // FILE_DEVICE_UNKNOWN << 16 | (FILE_READ_DATA|FILE_WRITE_DATA) << 14 | function << 2 | method
+    (0x22 << 16) | (3 << 14) | (function << 2) | method
 }
 
-pub const IOCTL_HELIOS_CTX_CREATE:   u32 = ctl_code(0x900, 0); // METHOD_BUFFERED   = 0x00222400
-pub const IOCTL_HELIOS_CTX_DESTROY:  u32 = ctl_code(0x901, 0); // METHOD_BUFFERED   = 0x00222404
-pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 = ctl_code(0x902, 1); // METHOD_IN_DIRECT  = 0x00222409
-pub const IOCTL_HELIOS_ALLOC_BLOB:   u32 = ctl_code(0x903, 0); // METHOD_BUFFERED   = 0x0022240C
-pub const IOCTL_HELIOS_MAP_BLOB:     u32 = ctl_code(0x904, 2); // METHOD_OUT_DIRECT = 0x00222412
-pub const IOCTL_HELIOS_WAIT_FENCE:   u32 = ctl_code(0x905, 0); // METHOD_BUFFERED   = 0x00222414
+pub const IOCTL_HELIOS_CTX_CREATE:   u32 = ctl_code(0x900, 0); // METHOD_BUFFERED   = 0x0022E400
+pub const IOCTL_HELIOS_CTX_DESTROY:  u32 = ctl_code(0x901, 0); // METHOD_BUFFERED   = 0x0022E404
+pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 = ctl_code(0x902, 1); // METHOD_IN_DIRECT  = 0x0022E409
+pub const IOCTL_HELIOS_ALLOC_BLOB:   u32 = ctl_code(0x903, 0); // METHOD_BUFFERED   = 0x0022E40C
+pub const IOCTL_HELIOS_MAP_BLOB:     u32 = ctl_code(0x904, 2); // METHOD_OUT_DIRECT = 0x0022E412
+pub const IOCTL_HELIOS_WAIT_FENCE:   u32 = ctl_code(0x905, 0); // METHOD_BUFFERED   = 0x0022E414
 ```
 
 **Method rationale:** the small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers — the mvisor pattern). SUBMIT_VENUS's Venus stream can be megabytes, so `METHOD_IN_DIRECT` carries the variable payload via a locked input MDL while a small fixed header (ctx_id / fence_id / buffer_size) rides the buffered system buffer. MAP_BLOB uses `METHOD_OUT_DIRECT` and returns a **user VA** (8-byte pointer) in its OUT buffer; the page mapping is the side effect (see §6.2).

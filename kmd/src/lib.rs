@@ -31,7 +31,6 @@ use wdk_alloc::WdkAllocator;
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod adapter;
-mod diag;
 mod error;
 mod fence;
 // The WDF interrupt object (ISR/DPC + WdfInterruptCreate) is not used in

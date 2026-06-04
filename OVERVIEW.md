@@ -123,12 +123,12 @@ The KMD is the only piece that runs in the Windows kernel. It:
 
 | Op | IOCTL constant | Value | Purpose |
 |----|----------------|-------|---------|
-| CTX_CREATE | `IOCTL_HELIOS_CTX_CREATE` | `0x00222400` | Create a Venus context (capset id in, ctx id out) |
-| CTX_DESTROY | `IOCTL_HELIOS_CTX_DESTROY` | `0x00222404` | Destroy a Venus context |
-| SUBMIT_VENUS | `IOCTL_HELIOS_SUBMIT_VENUS` | `0x00222409` | Submit an opaque Venus command blob (METHOD_IN_DIRECT via MDL) |
-| ALLOC_BLOB | `IOCTL_HELIOS_ALLOC_BLOB` | `0x0022240C` | Allocate a virtio-gpu blob resource (resource id out) |
-| MAP_BLOB | `IOCTL_HELIOS_MAP_BLOB` | `0x00222412` | Map a blob into the caller's address space (user VA out) |
-| WAIT_FENCE | `IOCTL_HELIOS_WAIT_FENCE` | `0x00222414` | Block on a `fence_id`→KEVENT with timeout |
+| CTX_CREATE | `IOCTL_HELIOS_CTX_CREATE` | `0x0022E400` | Create a Venus context (capset id in, ctx id out) |
+| CTX_DESTROY | `IOCTL_HELIOS_CTX_DESTROY` | `0x0022E404` | Destroy a Venus context |
+| SUBMIT_VENUS | `IOCTL_HELIOS_SUBMIT_VENUS` | `0x0022E409` | Submit an opaque Venus command blob (METHOD_IN_DIRECT via MDL) |
+| ALLOC_BLOB | `IOCTL_HELIOS_ALLOC_BLOB` | `0x0022E40C` | Allocate a virtio-gpu blob resource (resource id out) |
+| MAP_BLOB | `IOCTL_HELIOS_MAP_BLOB` | `0x0022E412` | Map a blob into the caller's address space (user VA out) |
+| WAIT_FENCE | `IOCTL_HELIOS_WAIT_FENCE` | `0x0022E414` | Block on a `fence_id`→KEVENT with timeout |
 
 ### 2. Helios ICD (`icd/`) — Vulkan Installable Client Driver
 

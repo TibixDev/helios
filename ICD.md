@@ -178,14 +178,14 @@ use windows::Win32::System::IO::DeviceIoControl;
 
 // CTL_CODE(DeviceType, Function, Method, Access)
 //   = (DeviceType<<16) | (Access<<14) | (Function<<2) | Method
-// DeviceType = FILE_DEVICE_UNKNOWN (0x22), Access = FILE_ANY_ACCESS (0),
+// DeviceType = FILE_DEVICE_UNKNOWN (0x22), Access = FILE_READ_DATA|FILE_WRITE_DATA (3),
 // Methods: BUFFERED=0, IN_DIRECT=1, OUT_DIRECT=2, NEITHER=3. (ARCH.md §3)
-const IOCTL_HELIOS_CTX_CREATE:   u32 = 0x0022_2400; // fn 0x900, BUFFERED
-const IOCTL_HELIOS_CTX_DESTROY:  u32 = 0x0022_2404; // fn 0x901, BUFFERED
-const IOCTL_HELIOS_SUBMIT_VENUS: u32 = 0x0022_2409; // fn 0x902, IN_DIRECT
-const IOCTL_HELIOS_ALLOC_BLOB:   u32 = 0x0022_240C; // fn 0x903, BUFFERED
-const IOCTL_HELIOS_MAP_BLOB:     u32 = 0x0022_2412; // fn 0x904, OUT_DIRECT
-const IOCTL_HELIOS_WAIT_FENCE:   u32 = 0x0022_2414; // fn 0x905, BUFFERED
+const IOCTL_HELIOS_CTX_CREATE:   u32 = 0x0022_E400; // fn 0x900, BUFFERED
+const IOCTL_HELIOS_CTX_DESTROY:  u32 = 0x0022_E404; // fn 0x901, BUFFERED
+const IOCTL_HELIOS_SUBMIT_VENUS: u32 = 0x0022_E409; // fn 0x902, IN_DIRECT
+const IOCTL_HELIOS_ALLOC_BLOB:   u32 = 0x0022_E40C; // fn 0x903, BUFFERED
+const IOCTL_HELIOS_MAP_BLOB:     u32 = 0x0022_E412; // fn 0x904, OUT_DIRECT
+const IOCTL_HELIOS_WAIT_FENCE:   u32 = 0x0022_E414; // fn 0x905, BUFFERED
 
 pub struct KmdConnection {
     device:        HANDLE,

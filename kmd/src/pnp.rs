@@ -14,8 +14,7 @@ use alloc::boxed::Box;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, BUS_INTERFACE_STANDARD, GUID, NTSTATUS, PINTERFACE,
     PWDFDEVICE_INIT, USHORT, WDFCMRESLIST, WDFDEVICE, WDFDRIVER, WDFOBJECT, WDFQUEUE,
-    WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_POWER_DEVICE_STATE, STATUS_SUCCESS,
-    STATUS_UNSUCCESSFUL,
+    WDF_NO_OBJECT_ATTRIBUTES, WDF_POWER_DEVICE_STATE, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use wdk_sys::NT_SUCCESS;
 
@@ -45,6 +44,14 @@ pub unsafe extern "C" fn evt_device_add(
     // SAFETY: `device_init` is the OS-provided init object (valid for this
     // callback); `&mut pnp` is a valid PWDF_PNPPOWER_EVENT_CALLBACKS.
     call_unsafe_wdf_function_binding!(WdfDeviceInitSetPnpPowerEventCallbacks, device_init, &mut pnp);
+
+    // Set the device I/O type (the one device-init call the working mvisor
+    // reference makes that we omitted). SAFETY: `device_init` valid.
+    call_unsafe_wdf_function_binding!(
+        WdfDeviceInitSetIoType,
+        device_init,
+        wdk_sys::_WDF_DEVICE_IO_TYPE::WdfDeviceIoDirect as wdk_sys::WDF_DEVICE_IO_TYPE
+    );
 
     // (b) Device attributes: register our typed context + a cleanup callback that
     //     frees the heap AdapterContext when the device is destroyed.
@@ -84,20 +91,26 @@ pub unsafe extern "C" fn evt_device_add(
         return status;
     }
 
-    // (f) Default parallel IO queue → EvtIoDeviceControl (the IOCTL spine).
-    let mut qcfg = wdf::io_queue_config_default(Some(evt_io_device_control));
-    // SAFETY: `device` valid; `&mut qcfg` valid; queue handle out is optional (null).
+    // (f) Default parallel IO queue → EvtIoDeviceControl (the IOCTL spine). The
+    //     default queue auto-receives IRP_MJ_DEVICE_CONTROL — no explicit routing
+    //     needed. (The earlier "default queue never dispatches" symptom was NOT
+    //     the queue *kind*; it was `Settings.Parallel.NumberOfPresentedRequests`
+    //     left at 0 in the queue-config builder — see wdf::io_queue_config.)
+    let mut qcfg = wdf::io_queue_config(Some(evt_io_device_control));
+    let mut queue: WDFQUEUE = core::ptr::null_mut();
+    // SAFETY: `device`/`&mut qcfg`/`&mut queue` are valid.
     let status = call_unsafe_wdf_function_binding!(
         WdfIoQueueCreate,
         device,
         &mut qcfg,
         WDF_NO_OBJECT_ATTRIBUTES,
-        WDF_NO_HANDLE.cast::<WDFQUEUE>()
+        &mut queue
     );
     if !NT_SUCCESS(status) {
         kmsg(c"Helios: WdfIoQueueCreate failed\n");
         return status;
     }
+    let _ = queue; // default queue auto-receives IOCTLs; handle not needed
 
     // (g) NO WDF interrupt object in Phase 1–3. The transport runs in pure
     //     polling mode with device interrupts suppressed (gpu.rs init →
@@ -110,7 +123,6 @@ pub unsafe extern "C" fn evt_device_add(
     //     re-enable device notifications. See interrupt.rs.
 
     kmsg(c"Helios: device added OK\n");
-    crate::diag::record(device, crate::diag::STAGE_DEVICE_ADD_OK, STATUS_SUCCESS);
     STATUS_SUCCESS
 }
 
@@ -126,7 +138,6 @@ pub unsafe extern "C" fn evt_device_prepare_hardware(
     _resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
     kmsg(c"Helios: prepare_hardware\n");
-    crate::diag::record(device, crate::diag::STAGE_PREPARE_HW_ENTER, STATUS_SUCCESS);
 
     // Query the PCI bus driver for the standard bus interface (config access).
     // SAFETY: zeroed BUS_INTERFACE_STANDARD is the documented input shape; the
@@ -146,7 +157,6 @@ pub unsafe extern "C" fn evt_device_prepare_hardware(
         kmsg(c"Helios: QueryForInterface(BUS_INTERFACE_STANDARD) failed\n");
         return status;
     }
-    crate::diag::record(device, crate::diag::STAGE_BUS_INTERFACE_OK, status);
 
     // Config access is needed only during PciTransport::new (cap/BAR discovery);
     // after init the transport uses MMIO. So we can release the bus-interface
@@ -168,13 +178,11 @@ pub unsafe extern "C" fn evt_device_prepare_hardware(
         Ok(gpu) => {
             adapter.set_virtio(Some(gpu));
             kmsg(c"Helios: virtio-gpu transport up\n");
-            crate::diag::record(device, crate::diag::STAGE_PREPARE_HW_OK, STATUS_SUCCESS);
             STATUS_SUCCESS
         }
         Err(e) => {
             kmsg(c"Helios: virtio-gpu init failed\n");
             let st: NTSTATUS = e.into();
-            crate::diag::record(device, crate::diag::STAGE_VIRTIO_INIT_FAILED, st);
             st
         }
     }
@@ -196,10 +204,9 @@ pub unsafe extern "C" fn evt_device_release_hardware(
 /// `EvtDeviceD0Entry` — no per-D0 work (transport lives across the prepare/release
 /// span). Present because ARCH §1 registers it.
 pub unsafe extern "C" fn evt_device_d0_entry(
-    device: WDFDEVICE,
+    _device: WDFDEVICE,
     _previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
-    crate::diag::record(device, crate::diag::STAGE_D0_ENTRY, STATUS_SUCCESS);
     STATUS_SUCCESS
 }
 

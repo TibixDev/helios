@@ -69,8 +69,10 @@ pub fn object_attributes_for_context(
 ) -> WDF_OBJECT_ATTRIBUTES {
     WDF_OBJECT_ATTRIBUTES {
         Size: size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
-        ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent
-            as WDF_EXECUTION_LEVEL,
+        // PASSIVE_LEVEL callbacks: our IOCTL handler does PASSIVE-only work
+        // (DmaBuffer alloc) and the synchronous virtio round-trip should not run
+        // at DISPATCH.
+        ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive as WDF_EXECUTION_LEVEL,
         SynchronizationScope: _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent
             as WDF_SYNCHRONIZATION_SCOPE,
         ContextTypeInfo: type_info,
@@ -97,20 +99,35 @@ pub fn pnp_power_callbacks(
 }
 
 /// `WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(config, WdfIoQueueDispatchParallel)`
-/// with an `EvtIoDeviceControl` handler. Sets DefaultQueue=TRUE and
-/// PowerManaged=WdfUseDefault as the C macro does.
-pub fn io_queue_config_default(
-    io_device_control: PFN_WDF_IO_QUEUE_IO_DEVICE_CONTROL,
-) -> WDF_IO_QUEUE_CONFIG {
-    WDF_IO_QUEUE_CONFIG {
+/// with an `EvtIoDeviceControl` handler — a default, non-power-managed parallel
+/// queue that auto-receives every request type (including IRP_MJ_DEVICE_CONTROL).
+///
+/// CRITICAL: a parallel queue MUST set `Settings.Parallel.NumberOfPresentedRequests`
+/// to the number of requests WDF may present to the driver concurrently. The real
+/// `WDF_IO_QUEUE_CONFIG_INIT` FORCEINLINE macro sets it to `(ULONG)-1` (unlimited)
+/// for `WdfIoQueueDispatchParallel`; our hand-rolled `_INIT` replica originally
+/// omitted it, so `..Default::default()` left it **0**. WDF's dispatch gate is
+/// `if (DriverIoCount < NumberOfPresentedRequests) present_request()` — with the
+/// field at 0 the queue *accepts* requests but presents **zero** of them, so every
+/// `DeviceIoControl` pended forever (cancellable, CPU idle) and `EvtIoDeviceControl`
+/// was never called. This was the Phase 3 IOCTL-dispatch blocker; toggling
+/// queue type/power/routing never touched this field. Non-power-managed so it
+/// dispatches regardless of device power state (the transport has its own
+/// virtio_lock).
+pub fn io_queue_config(io_device_control: PFN_WDF_IO_QUEUE_IO_DEVICE_CONTROL) -> WDF_IO_QUEUE_CONFIG {
+    let mut cfg = WDF_IO_QUEUE_CONFIG {
         Size: size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
         DispatchType: _WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel
             as wdk_sys::WDF_IO_QUEUE_DISPATCH_TYPE,
-        DefaultQueue: 1, // TRUE
-        PowerManaged: _WDF_TRI_STATE::WdfUseDefault as WDF_TRI_STATE,
+        DefaultQueue: 1, // default queue — auto-receives all request types
+        PowerManaged: _WDF_TRI_STATE::WdfFalse as WDF_TRI_STATE,
         EvtIoDeviceControl: io_device_control,
         ..Default::default()
-    }
+    };
+    // Unlimited concurrent presentation, matching WDF_IO_QUEUE_CONFIG_INIT's
+    // `(ULONG)-1`. Writing a union field is safe; this is the fix for the blocker.
+    cfg.Settings.Parallel.NumberOfPresentedRequests = ULONG::MAX;
+    cfg
 }
 
 /// `WDF_INTERRUPT_CONFIG_INIT(config, isr, dpc)`.

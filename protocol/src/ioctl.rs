@@ -22,8 +22,18 @@ pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32)
 // ── CTL_CODE field values ───────────────────────────────────────────────────
 /// `FILE_DEVICE_UNKNOWN` — Helios is not a standard device class.
 pub const FILE_DEVICE_UNKNOWN: u32 = 0x0000_0022;
-/// `FILE_ANY_ACCESS` — the device interface is ACL-guarded, not per-IOCTL.
+/// `FILE_ANY_ACCESS` — no per-IOCTL access requirement.
 pub const FILE_ANY_ACCESS: u32 = 0;
+/// `FILE_READ_ACCESS` (== FILE_READ_DATA).
+pub const FILE_READ_ACCESS: u32 = 0x0001;
+/// `FILE_WRITE_ACCESS` (== FILE_WRITE_DATA).
+pub const FILE_WRITE_ACCESS: u32 = 0x0002;
+/// Helios IOCTL RequiredAccess: every op transfers data both ways and is a
+/// privileged GPU operation, so require read+write access (the I/O manager then
+/// refuses the IOCTL on a handle lacking it). Per the WDK "Security Issues for
+/// I/O Control Codes" guidance, always specify a real RequiredAccess (not
+/// FILE_ANY_ACCESS). The ICD opens the device with GENERIC_READ|GENERIC_WRITE.
+pub const HELIOS_IOCTL_ACCESS: u32 = FILE_READ_ACCESS | FILE_WRITE_ACCESS;
 
 /// `METHOD_BUFFERED` — I/O manager double-buffers a fixed-size verb.
 pub const METHOD_BUFFERED: u32 = 0;
@@ -37,39 +47,39 @@ pub const METHOD_NEITHER: u32 = 3;
 /// Vendor function-code base (>= 0x800 is the customer-reserved range).
 pub const HELIOS_FN_BASE: u32 = 0x900;
 
-// ── IOCTL control codes (ARCH.md §3) ────────────────────────────────────────
-// Each value is asserted below to match the canonical table in ARCH.md §3.
+// ── IOCTL control codes ─────────────────────────────────────────────────────
+// RequiredAccess = read+write (HELIOS_IOCTL_ACCESS), not FILE_ANY_ACCESS — this
+// shifts the Access bits (14-15) of every code vs the original ARCH.md §3 table.
 
 /// Create a Venus virtio-gpu context. In/out: [`crate::HeliosEscapeCtxCreate`].
 pub const IOCTL_HELIOS_CTX_CREATE: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE, METHOD_BUFFERED, FILE_ANY_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 /// Destroy a context. In: [`crate::HeliosEscapeCtxDestroy`].
 pub const IOCTL_HELIOS_CTX_DESTROY: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 1, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 /// Submit an opaque Venus command stream. Buffered header
 /// [`crate::HeliosEscapeSubmitVenus`] + Venus blob via the input MDL.
 pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 2, METHOD_IN_DIRECT, FILE_ANY_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 2, METHOD_IN_DIRECT, HELIOS_IOCTL_ACCESS);
 /// Allocate a virtio-gpu blob resource. In/out: [`crate::HeliosEscapeAllocBlob`].
 pub const IOCTL_HELIOS_ALLOC_BLOB: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 3, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 /// Map a blob into the calling process; returns a user VA.
 /// In/out: [`crate::HeliosEscapeMapBlob`].
 pub const IOCTL_HELIOS_MAP_BLOB: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 4, METHOD_OUT_DIRECT, FILE_ANY_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 4, METHOD_OUT_DIRECT, HELIOS_IOCTL_ACCESS);
 /// Wait on a fence id. In: [`crate::HeliosEscapeWaitFence`].
 pub const IOCTL_HELIOS_WAIT_FENCE: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 5, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 
-// Lock the wire values: these bytes cross the user/kernel trust boundary and are
-// quoted verbatim in ARCH.md §3, so a refactor must not silently shift them.
+// Lock the wire values (with Access bits 14-15 = 0b11 = read+write).
 const _: () = {
-    assert!(IOCTL_HELIOS_CTX_CREATE == 0x0022_2400);
-    assert!(IOCTL_HELIOS_CTX_DESTROY == 0x0022_2404);
-    assert!(IOCTL_HELIOS_SUBMIT_VENUS == 0x0022_2409);
-    assert!(IOCTL_HELIOS_ALLOC_BLOB == 0x0022_240C);
-    assert!(IOCTL_HELIOS_MAP_BLOB == 0x0022_2412);
-    assert!(IOCTL_HELIOS_WAIT_FENCE == 0x0022_2414);
+    assert!(IOCTL_HELIOS_CTX_CREATE == 0x0022_E400);
+    assert!(IOCTL_HELIOS_CTX_DESTROY == 0x0022_E404);
+    assert!(IOCTL_HELIOS_SUBMIT_VENUS == 0x0022_E409);
+    assert!(IOCTL_HELIOS_ALLOC_BLOB == 0x0022_E40C);
+    assert!(IOCTL_HELIOS_MAP_BLOB == 0x0022_E412);
+    assert!(IOCTL_HELIOS_WAIT_FENCE == 0x0022_E414);
 };
 
 // ── Device interface GUID ───────────────────────────────────────────────────

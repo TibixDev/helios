@@ -623,16 +623,16 @@ The six wire ops keep their exact `helios_protocol` layout (`protocol/src/escape
 
 ### IOCTL constants
 
-`CTL_CODE(DeviceType, Function, Method, Access) = (DeviceType<<16)|(Access<<14)|(Function<<2)|Method`, with `DeviceType = FILE_DEVICE_UNKNOWN (0x22)`, `Access = FILE_ANY_ACCESS (0)`, function base `0x900` (vendor range), methods `BUFFERED=0 / IN_DIRECT=1 / OUT_DIRECT=2 / NEITHER=3`. The constants live in `helios_protocol::escape`:
+`CTL_CODE(DeviceType, Function, Method, Access) = (DeviceType<<16)|(Access<<14)|(Function<<2)|Method`, with `DeviceType = FILE_DEVICE_UNKNOWN (0x22)`, `Access = FILE_READ_DATA|FILE_WRITE_DATA (3)`, function base `0x900` (vendor range), methods `BUFFERED=0 / IN_DIRECT=1 / OUT_DIRECT=2 / NEITHER=3`. The constants live in `helios_protocol::ioctl` (asserted source of truth):
 
 | Op | IOCTL constant | Value | Method |
 |----|----------------|-------|--------|
-| CTX_CREATE   | `IOCTL_HELIOS_CTX_CREATE`   | `0x00222400` | BUFFERED  |
-| CTX_DESTROY  | `IOCTL_HELIOS_CTX_DESTROY`  | `0x00222404` | BUFFERED  |
-| SUBMIT_VENUS | `IOCTL_HELIOS_SUBMIT_VENUS` | `0x00222409` | IN_DIRECT |
-| ALLOC_BLOB   | `IOCTL_HELIOS_ALLOC_BLOB`   | `0x0022240C` | BUFFERED  |
-| MAP_BLOB     | `IOCTL_HELIOS_MAP_BLOB`     | `0x00222412` | OUT_DIRECT |
-| WAIT_FENCE   | `IOCTL_HELIOS_WAIT_FENCE`   | `0x00222414` | BUFFERED  |
+| CTX_CREATE   | `IOCTL_HELIOS_CTX_CREATE`   | `0x0022E400` | BUFFERED  |
+| CTX_DESTROY  | `IOCTL_HELIOS_CTX_DESTROY`  | `0x0022E404` | BUFFERED  |
+| SUBMIT_VENUS | `IOCTL_HELIOS_SUBMIT_VENUS` | `0x0022E409` | IN_DIRECT |
+| ALLOC_BLOB   | `IOCTL_HELIOS_ALLOC_BLOB`   | `0x0022E40C` | BUFFERED  |
+| MAP_BLOB     | `IOCTL_HELIOS_MAP_BLOB`     | `0x0022E412` | OUT_DIRECT |
+| WAIT_FENCE   | `IOCTL_HELIOS_WAIT_FENCE`   | `0x0022E414` | BUFFERED  |
 
 **Method rationale:** small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers the system buffer). `SUBMIT_VENUS`'s Venus stream can be megabytes, so it uses `METHOD_IN_DIRECT`: a small fixed header (`ctx_id`/`fence_id`/`buffer_size`) rides the buffered system buffer while the variable Venus blob arrives as a locked MDL (`WdfRequestRetrieveInputWdmMdl`). `MAP_BLOB` returns a **user VA**, not a GPA: the kernel does `MmMapLockedPagesSpecifyCache(blobMdl, UserMode, …)` and writes the resulting user VA into the OUT buffer — hence the op struct field is `out_user_va` (renamed from the old `out_gpa`).
 
