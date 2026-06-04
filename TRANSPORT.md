@@ -7,7 +7,7 @@ This document describes the exact wire format used to send Vulkan commands from 
 The stack is:
 ```
 ICD (user-mode)   →   KMD (kernel-mode)   →   virtio-gpu device   →   virglrenderer (host)
-Venus command buffer   D3DKMTEscape / DMA   Virtqueue CMD_SUBMIT_3D   Venus decoder + Vulkan
+Venus command buffer   DeviceIoControl (IOCTL)   Virtqueue CMD_SUBMIT_3D   Venus decoder + Vulkan
 ```
 
 ---
@@ -204,8 +204,8 @@ create_blob.nr_entries  = 0;
 
 virtio.send_cmd_sync(&create_blob, &mut response)?;
 
-// 2. Map the blob into guest GPA space
-// (The KMD maps this into the aperture segment for the ICD to write to)
+// 2. Map the blob into the calling process
+// (The KMD maps this to a user VA for the ICD to write to — see §6.2)
 let mut map_blob = VirtioGpuResourceMapBlob::zeroed();
 map_blob.hdr.type_    = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
 map_blob.hdr.ctx_id   = ctx_id;
@@ -243,128 +243,122 @@ Once the ring is set up, the ICD writes commands into the ring and submits via:
 **For our driver, use Option B initially (simpler), then optimize to Option A.**
 
 ```rust
-// Submitting a Venus command buffer via the KMD (from the ICD via D3DKMTEscape):
+// Submitting a Venus command buffer via the KMD (from the ICD via DeviceIoControl):
+
+// ICD opens the device once (cached for the process lifetime):
+//   SetupDiGetClassDevs(&GUID_DEVINTERFACE_HELIOS, ...) → enumerate the
+//   interface → SetupDiGetDeviceInterfaceDetail (device path) →
+//   CreateFileW(path, GENERIC_READ|GENERIC_WRITE, ...) → handle.
 
 // ICD prepares a Venus-encoded buffer:
 let mut buf = Vec::<u8>::new();
 venus_encode_vkCreateInstance(&mut buf, &create_info);
 
-// ICD calls D3DKMTEscape to hand the buffer to the KMD:
-let escape_in = HeliosEscapeSubmitVenus {
-    cmd_type: HELIOS_ESCAPE_SUBMIT_VENUS,
-    ctx_id: ctx_id,
-    buffer_ptr: buf.as_ptr() as u64,
-    buffer_size: buf.len() as u32,
-    fence_id: next_fence_id(),
-};
-D3DKMTEscape(&escape_params)?;
+// ICD issues IOCTL_HELIOS_SUBMIT_VENUS (METHOD_IN_DIRECT): a small fixed
+// header (ctx_id / fence_id / buffer_size) rides the buffered system buffer
+// and the variable Venus blob is carried via the locked input MDL.
+let hdr = HeliosSubmitVenus { fence_id: next_fence_id(), ctx_id, buffer_size: buf.len() as u32, .. };
+DeviceIoControl(handle, IOCTL_HELIOS_SUBMIT_VENUS, &hdr_and_blob, .., &mut bytes_returned, null)?;
 
-// KMD receives DxgkDdiEscape, builds VirtioGpuCmdSubmit, sends via ctrl virtqueue.
+// KMD's EvtIoDeviceControl reads the input, builds VirtioGpuCmdSubmit, sends via
+// the ctrl virtqueue.
 // virglrenderer decodes Venus bytes, calls vkCreateInstance on host GPU.
-// Fence completion comes back via interrupt → DxgkCbNotifyInterrupt.
+// Fence completion comes back via the virtio interrupt → DPC signals the
+// per-fence KEVENT (or completes the pended WAIT_FENCE IOCTL).
 ```
 
 ---
 
 ## 3. ICD ↔ KMD Communication
 
-> **ERRATA (2026-06-04): `helios_protocol::escape` (protocol/src/escape.rs) is the SOURCE OF TRUTH for these layouts, not the sketches below.** The real `HeliosEscapeSubmitVenus` is **`fence_id`-first** (8-byte aligned, padding-free, `Pod`) — a different field order from §3.1. The §3.2 `dxgkddi_escape` match is also **missing the `WAIT_FENCE` and `CTX_DESTROY` arms** (both ops are defined in escape.rs); the real handler dispatches all six ops. Validate every guest-supplied size/offset before reading (guest→kernel trust boundary).
+> **ERRATA (2026-06-04): `helios_protocol::escape` (protocol/src/escape.rs) is the SOURCE OF TRUTH for the op-struct layouts (and the IOCTL codes + `GUID_DEVINTERFACE_HELIOS`), not the sketches below.** The op structs are `Pod` (8-byte aligned, padding-free) — e.g. `HeliosSubmitVenus` is **`fence_id`-first**, a different field order from the prose. The KMDF `EvtIoDeviceControl` handler dispatches **all six** ops (CTX_CREATE, CTX_DESTROY, SUBMIT_VENUS, ALLOC_BLOB, MAP_BLOB, WAIT_FENCE). Validate every guest-supplied size/offset against the WDF-reported in/out length before reading (guest→kernel trust boundary).
 
-### 3.1 D3DKMTEscape Protocol
+### 3.1 Device Interface & IOCTL Codes
 
-D3DKMTEscape is the standard WDDM mechanism for user-mode → kernel-mode out-of-band communication. The ICD uses this for:
-- Submitting Venus command buffers
-- Creating/destroying Venus contexts
-- Memory mapping requests
-- Fence wait queries
+User mode reaches the KMD via `DeviceIoControl` on a device interface — there is no WDDM escape carrier. The ICD discovers and opens the device:
 
-```rust
-// Escape command codes (shared between ICD and KMD)
-pub const HELIOS_ESCAPE_SUBMIT_VENUS:      u32 = 0x0001;
-pub const HELIOS_ESCAPE_CTX_CREATE:        u32 = 0x0002;
-pub const HELIOS_ESCAPE_CTX_DESTROY:       u32 = 0x0003;
-pub const HELIOS_ESCAPE_ALLOC_BLOB:        u32 = 0x0004;
-pub const HELIOS_ESCAPE_MAP_BLOB:          u32 = 0x0005;
-pub const HELIOS_ESCAPE_WAIT_FENCE:        u32 = 0x0006;
+- `SetupDiGetClassDevs(&GUID_DEVINTERFACE_HELIOS, NULL, NULL, DIGCF_DEVICEINTERFACE|DIGCF_PRESENT)`
+- `SetupDiEnumDeviceInterfaces` → `SetupDiGetDeviceInterfaceDetail` (device path)
+- `CreateFileW(path, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE, OPEN_EXISTING, ...)`
+- `DeviceIoControl(handle, IOCTL_HELIOS_*, in_buf, in_len, out_buf, out_len, &bytes, NULL)`
 
-/// Header for all escape commands
-#[repr(C)]
-pub struct HeliosEscapeHeader {
-    pub magic:    u32,    // 0x48454C53 ('HELS')
-    pub cmd_type: u32,
-    pub version:  u32,    // = 1
-    pub size:     u32,    // total escape buffer size
-}
+The handle is opened **once** and cached for the process lifetime (MAP_BLOB maps into the calling process, so the ICD must issue subsequent IOCTLs from the same process that opened the handle). `GUID_DEVINTERFACE_HELIOS` is defined once in `helios_protocol` and shared by KMD and ICD.
 
-/// HELIOS_ESCAPE_SUBMIT_VENUS payload
-#[repr(C)]
-pub struct HeliosEscapeSubmitVenus {
-    pub hdr:          HeliosEscapeHeader,
-    pub ctx_id:       u32,
-    pub fence_id:     u64,
-    pub buffer_size:  u32,
-    pub pad:          u32,
-    // Followed by `buffer_size` bytes of Venus commands
-}
+IOCTL control codes are built with the standard macro:
+
+```
+CTL_CODE(DeviceType, Function, Method, Access)
+    = (DeviceType<<16) | (Access<<14) | (Function<<2) | Method
 ```
 
-### 3.2 KMD DxgkDdiEscape Handler
+with `DeviceType = FILE_DEVICE_UNKNOWN (0x22)`, `Access = FILE_ANY_ACCESS (0)`, function base `0x900` (vendor range ≥ 0x800). Methods: `METHOD_BUFFERED=0`, `METHOD_IN_DIRECT=1`, `METHOD_OUT_DIRECT=2`, `METHOD_NEITHER=3`.
 
 ```rust
-// src/ddi/escape.rs
-
-pub unsafe extern "C" fn dxgkddi_escape(
-    miniport_device_context: *mut core::ffi::c_void,
-    escape: *const DXGKARG_ESCAPE,
-) -> NTSTATUS {
-    let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
-    let args = unsafe { &*escape };
-
-    // Validate: must be from a trusted process (PrivilegedEscape = false means user-mode)
-    if args.pPrivateDriverData.is_null() || args.PrivateDriverDataSize < 16 {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let hdr = unsafe { &*(args.pPrivateDriverData as *const HeliosEscapeHeader) };
-
-    // Validate magic
-    if hdr.magic != 0x48454C53 { return STATUS_INVALID_PARAMETER; }
-    if hdr.size as usize > args.PrivateDriverDataSize as usize { return STATUS_INVALID_PARAMETER; }
-
-    match hdr.cmd_type {
-        HELIOS_ESCAPE_SUBMIT_VENUS => escape_submit_venus(adapter, args),
-        HELIOS_ESCAPE_CTX_CREATE   => escape_ctx_create(adapter, args),
-        HELIOS_ESCAPE_CTX_DESTROY  => escape_ctx_destroy(adapter, args),
-        HELIOS_ESCAPE_ALLOC_BLOB   => escape_alloc_blob(adapter, args),
-        HELIOS_ESCAPE_MAP_BLOB     => escape_map_blob(adapter, args),
-        _ => STATUS_NOT_SUPPORTED,
-    }
+// Shared between ICD and KMD (protocol/src/escape.rs is the source of truth).
+const fn ctl_code(function: u32, method: u32) -> u32 {
+    // FILE_DEVICE_UNKNOWN << 16 | FILE_ANY_ACCESS << 14 | function << 2 | method
+    (0x22 << 16) | (0 << 14) | (function << 2) | method
 }
 
-fn escape_submit_venus(adapter: &mut AdapterContext, args: &DXGKARG_ESCAPE) -> NTSTATUS {
-    let payload = unsafe { &*(args.pPrivateDriverData as *const HeliosEscapeSubmitVenus) };
+pub const IOCTL_HELIOS_CTX_CREATE:   u32 = ctl_code(0x900, 0); // METHOD_BUFFERED   = 0x00222400
+pub const IOCTL_HELIOS_CTX_DESTROY:  u32 = ctl_code(0x901, 0); // METHOD_BUFFERED   = 0x00222404
+pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 = ctl_code(0x902, 1); // METHOD_IN_DIRECT  = 0x00222409
+pub const IOCTL_HELIOS_ALLOC_BLOB:   u32 = ctl_code(0x903, 0); // METHOD_BUFFERED   = 0x0022240C
+pub const IOCTL_HELIOS_MAP_BLOB:     u32 = ctl_code(0x904, 2); // METHOD_OUT_DIRECT = 0x00222412
+pub const IOCTL_HELIOS_WAIT_FENCE:   u32 = ctl_code(0x905, 0); // METHOD_BUFFERED   = 0x00222414
+```
 
-    // Validate sizes
-    let data_offset = core::mem::size_of::<HeliosEscapeSubmitVenus>();
-    let expected_total = data_offset + payload.buffer_size as usize;
-    if expected_total > args.PrivateDriverDataSize as usize {
-        return STATUS_INVALID_PARAMETER;
-    }
+**Method rationale:** the small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers — the mvisor pattern). SUBMIT_VENUS's Venus stream can be megabytes, so `METHOD_IN_DIRECT` carries the variable payload via a locked input MDL while a small fixed header (ctx_id / fence_id / buffer_size) rides the buffered system buffer. MAP_BLOB uses `METHOD_OUT_DIRECT` and returns a **user VA** (8-byte pointer) in its OUT buffer; the page mapping is the side effect (see §6.2).
 
-    // Pointer to Venus command bytes (in user-mode process memory, but
-    // pPrivateDriverData is kernel-accessible during the escape call).
-    let venus_data = unsafe {
-        core::slice::from_raw_parts(
-            (args.pPrivateDriverData as *const u8).add(data_offset),
-            payload.buffer_size as usize,
-        )
+The op-struct byte layouts (`HeliosCtxCreate`, `HeliosCtxDestroy`, `HeliosSubmitVenus`, `HeliosAllocBlob`, `HeliosMapBlob`, `HeliosWaitFence`) live in `protocol/src/escape.rs` as `Pod` types. The old 16-byte `HeliosEscapeHeader` (magic/cmd_type/version/size) is **redundant** — the IOCTL control code *is* the verb and WDF validates the in/out lengths — so it is dropped (or kept only as a cheap version sanity check); the op-struct layouts are unchanged.
+
+### 3.2 KMD EvtIoDeviceControl Handler
+
+```rust
+// src/ioctl.rs
+
+pub extern "C" fn evt_io_device_control(
+    queue: WDFQUEUE,
+    request: WDFREQUEST,
+    output_buffer_length: usize,
+    input_buffer_length: usize,
+    io_control_code: u32,
+) {
+    // SAFETY: WDF guarantees the queue's parent device carries our AdapterContext.
+    let adapter = adapter_from_queue(queue);
+
+    let status = match io_control_code {
+        IOCTL_HELIOS_CTX_CREATE   => ioctl_ctx_create(adapter, request),
+        IOCTL_HELIOS_CTX_DESTROY  => ioctl_ctx_destroy(adapter, request),
+        IOCTL_HELIOS_SUBMIT_VENUS => ioctl_submit_venus(adapter, request),
+        IOCTL_HELIOS_ALLOC_BLOB   => ioctl_alloc_blob(adapter, request),
+        IOCTL_HELIOS_MAP_BLOB     => ioctl_map_blob(adapter, request),
+        IOCTL_HELIOS_WAIT_FENCE   => ioctl_wait_fence(adapter, request),
+        _ => STATUS_INVALID_DEVICE_REQUEST,
     };
 
-    // Submit to virglrenderer via virtqueue
-    let virtio = adapter.virtio.as_mut().unwrap();
-    virtio.submit_venus_cmd(payload.ctx_id, payload.fence_id, venus_data)
+    // ioctl_* set `bytes_returned` for ops with an OUT buffer; default 0.
+    unsafe { WdfRequestCompleteWithInformation(request, status, /* bytes */ 0) };
+}
+
+fn ioctl_submit_venus(adapter: &AdapterContext, request: WDFREQUEST) -> NTSTATUS {
+    // Buffered system buffer carries the fixed header (fence_id/ctx_id/buffer_size);
+    // the variable Venus blob arrives as a locked input MDL (METHOD_IN_DIRECT).
+    let hdr: HeliosSubmitVenus = match retrieve_input_pod(request) {
+        Ok(h) => h,
+        Err(s) => return s,
+    };
+    let venus_data = match retrieve_input_mdl(request, hdr.buffer_size as usize) {
+        Ok(d) => d,           // validated: MDL byte count >= buffer_size
+        Err(s) => return s,
+    };
+
+    // Same body as the previous ddi/escape.rs handler — ports 1:1.
+    adapter.with_virtio(|v| v.submit_venus(hdr.ctx_id, hdr.fence_id, venus_data))
 }
 ```
+
+Each `ioctl_*` retrieves its buffers (`WdfRequestRetrieveInputBuffer` / `WdfRequestRetrieveOutputBuffer` for buffered ops; `WdfRequestRetrieveInputWdmMdl` for SUBMIT_VENUS), validates every guest-supplied size/offset against the WDF-reported in/out length, runs the same `adapter.with_virtio(|v| v.ctx_create / ctx_destroy / submit_venus / alloc_blob / map_blob / ...)` body the WDDM-era `ddi/escape.rs` used, then completes the request with `WdfRequestCompleteWithInformation(request, status, bytes_returned)`. WAIT_FENCE may pend the request and complete it later from the DPC (see §5.1).
 
 ---
 
@@ -507,15 +501,16 @@ For each Vulkan function you implement, look at:
 ### 5.1 Fence Flow
 
 ```
-Guest ICD                  KMD                    virglrenderer
-─────────                  ───                    ─────────────
-Submit Venus cmd ─────►  DxgkDdiEscape()
-                         submit via virtqueue ──► decode + execute Vulkan
-                                                 write fence completion
-                         ◄── interrupt            ◄── used ring entry
-DxgkCbNotifyInterrupt
-→ fence signaled
-ICD unblocks ◄────────── monitored fence value updated
+Guest ICD                  KMD                              virglrenderer
+─────────                  ───                              ─────────────
+Submit Venus cmd ─────►  EvtIoDeviceControl
+                         (IOCTL_HELIOS_SUBMIT_VENUS)
+                         submit via virtqueue ──────────► decode + execute Vulkan
+                                                          write fence completion
+                         ◄── virtio ISR                    ◄── used ring entry
+                         → DPC drains used ring
+                         → signal fence_id KEVENT
+ICD unblocks ◄────────── (or complete pended WAIT_FENCE IOCTL)
 ```
 
 ### 5.2 Fence Encoding in virtio-gpu
@@ -525,17 +520,11 @@ Every command with `VIRTIO_GPU_FLAG_FENCE` set causes virglrenderer to:
 2. Write a `VIRTIO_GPU_RESP_OK_NODATA` response with the same `fence_id`
 3. Mark the descriptor as used in the used ring
 
-The KMD checks the used ring in the ISR and calls `DxgkCbNotifyInterrupt` with the fence value.
+The virtio ISR acks the interrupt and queues a DPC; the DPC drains the used ring and signals the fence value.
 
-### 5.3 Monitored Fence Setup (WDDM 2.0)
+### 5.3 Fence Signaling (KMDF)
 
-```rust
-// When creating a GPU context, set up a monitored fence:
-let mut create_sync = DXGKARG_CREATESYNCHRONIZATIONOBJECT2::default();
-create_sync.Info.Type = DXGK_SYNCHRONIZATIONOBJECT_TYPE::MonitoredFence;
-create_sync.Info.MonitoredFence.InitialFenceValue = 0;
-// ... Dxgkrnl fills in FenceValueCPUVirtualAddress and FenceValueGPUVirtualAddress
-```
+There are no WDDM monitored fences. The KMD keeps a `fence_id → KEVENT` table in the `AdapterContext`. On submit, the requested `fence_id` rides the `VIRTIO_GPU_FLAG_FENCE` command. When the DPC drains the matching used-ring entry it signals that `fence_id`'s KEVENT — and, if a `IOCTL_HELIOS_WAIT_FENCE` request was pended on that fence, completes the pended IOCTL. WAIT_FENCE carries `fence_id` + `timeout_ns`; the handler either returns immediately if the fence is already signaled, or blocks on (pends against) the KEVENT until the DPC fires or the timeout elapses.
 
 ---
 
@@ -547,14 +536,14 @@ Every GPU buffer/image in the guest is backed by a virtio-gpu **resource ID** (u
 
 ```
 ICD: vkCreateBuffer()
-  → ICD calls DxgkDdiCreateAllocation (via D3D runtime)
+  → ICD issues IOCTL_HELIOS_ALLOC_BLOB
   → KMD assigns resource_id (monotonically increasing u32)
   → KMD sends VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB (for host memory)
   → KMD sends VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE (attach to Venus ctx)
-  → Returns resource handle to ICD
+  → Returns resource handle (out_resource_id) to ICD
 
 ICD: vkDestroyBuffer()
-  → ICD calls DxgkDdiDestroyAllocation
+  → ICD issues the free/unref IOCTL
   → KMD sends VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE
   → KMD sends VIRTIO_GPU_CMD_RESOURCE_UNREF
 ```
@@ -586,11 +575,11 @@ The closest prior art is **[tenclass/mvisor-win-vgpu-driver](https://github.com/
 
 - **Two-descriptor `SUBMIT_3D`** (Phase 4): a small *mutable* `virtio_gpu_cmd_submit` header in descriptor 0, and the large command body passed **by physical address** in descriptor 1, pointing into a pre-reserved page-aligned slice of a contiguous pool. Avoids per-submit allocation; keeps the fence-flag header writable.
 - **Bitmap page sub-allocator** (Phase 3): one big `MmAllocateContiguousMemory` region sub-allocated with an `RtlBitmap` (page-granular, last-free-index hint), instead of many per-allocation contiguous allocs.
-- **Host-visible blob mapping** (Phase 3): `RESOURCE_CREATE_BLOB(HOST3D)` → `RESOURCE_MAP_BLOB` → read `virtio_gpu_resp_map_info { map_info, gpa, size }` → `MmMapIoSpaceEx(gpa, …)` using the **cache mode the host returns in `map_info`** (CACHED / WC / UNCACHED). That `map_info` byte is how the aperture segment should choose `PAGE_WRITECOMBINE` vs cached — the spec-sanctioned coherent-host-memory path.
-  > **OPEN ITEM (2026-06-04):** the actual `VirtioGpuRespMapInfo` (protocol/src/virtio_gpu.rs, 32B) carries ONLY `map_info` (+padding) — **NOT `gpa`/`size`**. The blob GPA almost certainly comes from the virtio-gpu **shared-memory PCI region** (`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` / hostmem), addressed by an offset, not from this response struct. Confirm against the virtio-gpu spec + virglrenderer BEFORE coding MAP_BLOB — this same region also fills `query_segments` `seg.BaseAddress` (currently 0). Mis-sourcing the GPA = silent host-memory corruption.
+- **Host-visible blob mapping** (Phase 3): `RESOURCE_CREATE_BLOB(HOST3D)` → `RESOURCE_MAP_BLOB` → `MmMapLockedPagesSpecifyCache(mdl, UserMode, …)` using the **cache mode the host returns in `map_info`** (CACHED / WC / UNCACHED), returning a **user VA** to the ICD (see §6.2). That `map_info` byte chooses `PAGE_WRITECOMBINE` vs cached — the spec-sanctioned coherent-host-memory path.
+  > **RESOLVED (2026-06-04):** the blob GPA is **not** in `VirtioGpuRespMapInfo` (protocol/src/virtio_gpu.rs, 32B — it carries only the `map_info` caching byte + padding). QEMU exposes a host-visible memory window as a prefetchable 64-bit PCI BAR (typically BAR4) advertised by a `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` cap (cap type 8) with `shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE`, size = device `hostmem=` (256M..8G). The KMD records that BAR's guest-physical base during the cap scan; on MAP_BLOB it computes `gpa = host_visible_bar_base + offset` (`RESOURCE_MAP_BLOB` injects the resource's mapping at that offset), builds an MDL over those pages, and `MmMapLockedPagesSpecifyCache(mdl, UserMode, <cache>)` to return the user VA. (See ARCH.md §6.)
 - **Capset / `context_init` negotiation** (Phase 4): `GET_CAPSET_INFO`/`GET_CAPSET` + a supported-capset bitmask + `CTX_CREATE` with `context_init` = capset id. Identical in shape for Venus — use `VIRTIO_GPU_CAPSET_VENUS` and parse the Venus caps.
 - **ISR/DPC split** (Phase 2): the ISR only reads ISR/MSI status and queues a DPC; the DPC drains the used ring, dispatches on `hdr.type`, frees command buffers, and signals fences — per-queue spinlock + MSI-X message→queue map. Enforces the invariant *free descriptors only on used-ring completion*.
-- **Interim fences** (before WDDM monitored fences): a `fence_id → KEVENT` map signaled from the DPC + a blocking wait.
+- **Fence signaling**: a `fence_id → KEVENT` map; the DPC signals the matching KEVENT (and completes any pended WAIT_FENCE IOCTL) on used-ring completion + a blocking wait in WAIT_FENCE.
 
 **Gotchas:**
 - mvisor indexes queues **COMMAND=0 / CONTROL=1** — *opposite* of standard virtio-gpu (controlq=0). Helios uses the **standard** virtio-gpu layout (control queue = 0). Do not copy mvisor's ordering.
@@ -598,4 +587,4 @@ The closest prior art is **[tenclass/mvisor-win-vgpu-driver](https://github.com/
 
 **Other prior art:** [Keenuts/virtio-gpu-win-icd](https://github.com/Keenuts/virtio-gpu-win-icd), [kjliew/qemu-3dfx](https://github.com/kjliew/qemu-3dfx).
 
-**Strategic fallback:** mvisor shows a *simpler* architecture that works — ship your own ICD over a private WDF device and skip WDDM (the qemu-3dfx model). Helios's WDDM + Vulkan-loader + DXVK/VKD3D path is more integrated and supports D3D11/12 (not just GL), which is the mandate — but the WDF+own-ICD approach is a proven fallback if the WDDM render path proves intractable.
+**Chosen architecture:** Helios follows the mvisor model — a System-class KMDF function driver exposing a private device interface (`DeviceIoControl`), with our own Vulkan ICD enumerated by the Windows Vulkan loader via registry JSON. WDDM / Dxgkrnl / D3DKMTEscape are dropped entirely (see ARCH.md): a WDDM render adapter would have to pass dxgkrnl's AddAdapter capability/version contract for GPU scheduling + memory features the host already owns under Venus replay — pure cost, no benefit. The Vulkan-loader + DXVK/VKD3D path still gets us D3D11/12 (not just GL), which is the mandate, and the KMDF + own-ICD IOCTL channel is the proven, simpler route there.

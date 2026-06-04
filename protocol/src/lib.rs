@@ -3,13 +3,13 @@
 //! This crate is the single source of truth for every byte that crosses a
 //! trust/ABI boundary in Helios:
 //!
-//!   ICD (user-mode, std)  --D3DKMTEscape-->  KMD (kernel-mode, no_std)
-//!   KMD                    --virtqueue-->     virtio-gpu device / virglrenderer
+//!   ICD (user-mode)  --DeviceIoControl(IOCTL)-->  KMD (kernel-mode, no_std)
+//!   KMD              --virtqueue-->               virtio-gpu device / virglrenderer
 //!
-//! Both the `helios_kmd` and `helios_icd` crates depend on this crate so the
-//! escape structs and virtio-gpu command structs can never drift apart. It is
-//! `#![no_std]` so the kernel-mode KMD can use it; std crates can depend on a
-//! no_std crate freely.
+//! The `helios_kmd` crate depends on this crate so the IOCTL payload structs,
+//! the IOCTL codes/GUID, and the virtio-gpu command structs can never drift
+//! apart; the (C, Mesa-venus) ICD mirrors the same constants. It is
+//! `#![no_std]` so the kernel-mode KMD can use it.
 //!
 //! References:
 //!   - TRANSPORT.md (this repo) — escape protocol + virtio-gpu layouts
@@ -23,7 +23,9 @@
 pub mod virtio_gpu;
 pub mod escape;
 pub mod features;
+pub mod ioctl;
 
 pub use escape::*;
 pub use features::*;
+pub use ioctl::*;
 pub use virtio_gpu::*;

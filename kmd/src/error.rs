@@ -1,6 +1,9 @@
 //! Driver error type mapped to NTSTATUS codes.
 
-use crate::dxgk::*;
+use wdk_sys::{
+    NTSTATUS, STATUS_DEVICE_DOES_NOT_EXIST, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
+    STATUS_IO_DEVICE_ERROR, STATUS_NOT_IMPLEMENTED,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum DriverError {
@@ -26,13 +29,5 @@ impl DriverError {
 impl From<DriverError> for NTSTATUS {
     fn from(e: DriverError) -> Self {
         e.into_ntstatus()
-    }
-}
-
-/// Convenience: turn a `Result<(), DriverError>` into an NTSTATUS.
-pub fn status_of(result: Result<(), DriverError>) -> NTSTATUS {
-    match result {
-        Ok(()) => STATUS_SUCCESS,
-        Err(e) => e.into_ntstatus(),
     }
 }

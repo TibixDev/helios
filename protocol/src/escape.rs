@@ -1,10 +1,17 @@
-//! Helios D3DKMTEscape protocol (TRANSPORT.md §3).
+//! Helios IOCTL payload structs (ARCH.md §3; TRANSPORT.md §3).
 //!
-//! The ICD (user-mode) issues `D3DKMTEscape` with a buffer beginning with a
-//! [`HeliosEscapeHeader`]; the KMD's `DxgkDdiEscape` validates the magic/size
-//! and dispatches on `cmd_type`. All payload structs are `repr(C)`, padding-free
-//! (so they derive `Pod`/`Zeroable`), and laid out 8-byte-aligned-first to avoid
-//! implicit padding.
+//! These are the in/out buffer layouts the ICD passes to `DeviceIoControl` on
+//! `GUID_DEVINTERFACE_HELIOS`; the IOCTL control code (see [`crate::ioctl`]) is
+//! the verb, and the KMD's `EvtIoDeviceControl` validates the WDF-reported
+//! buffer lengths against these sizes before reading. All payload structs are
+//! `repr(C)`, padding-free (so they derive `Pod`/`Zeroable`), and laid out
+//! 8-byte-aligned-first to avoid implicit padding.
+//!
+//! HISTORICAL NAMING: the `HeliosEscape*` type names and the `HeliosEscapeHeader`
+//! date from the abandoned WDDM `D3DKMTEscape` carrier (see ARCH.md §0). The wire
+//! layout is unchanged across the pivot, so the names are kept to avoid churn in
+//! a byte-ABI crate; the header is now an optional sanity check (the IOCTL code
+//! already identifies the verb and WDF validates lengths).
 //!
 //! NOTE: the field *order* of [`HeliosEscapeSubmitVenus`] differs from the
 //! sketch in TRANSPORT.md §3.1 — the 64-bit `fence_id` is placed first so the
@@ -96,13 +103,14 @@ pub struct HeliosEscapeAllocBlob {
     pub out_resource_id: u32,  // out: assigned resource id
 }
 
-/// `HELIOS_ESCAPE_MAP_BLOB`. Maps a blob into the guest aperture; the KMD
-/// returns the guest physical address the ICD can mmap. 32 bytes.
+/// `HELIOS_ESCAPE_MAP_BLOB`. Maps a blob into the calling process; the KMD maps
+/// the host-visible pages with `MmMapLockedPagesSpecifyCache(UserMode)` and
+/// returns the resulting **user VA** (not a GPA — see ARCH.md §3, §6). 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeMapBlob {
     pub hdr: HeliosEscapeHeader,
-    pub out_gpa: u64,      // out: guest physical address of the mapping
+    pub out_user_va: u64,  // out: user-mode virtual address of the mapping
     pub resource_id: u32,  // in:  blob to map
     pub padding: u32,
 }

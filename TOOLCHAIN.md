@@ -155,7 +155,7 @@ A Windows 11 dev VM named `win11` is reachable via `ssh win` (preconfigured). It
 
 - **VS 2022 Build Tools** — "Desktop development with C++" (MSVC v143 + Spectre-mitigated x64 libs).
 - **WDK** — kit **10.0.26100.0**. Must be a *complete* kit (SDK **and** WDK at the same version): `wdk-build` picks the **highest** installed kit with **no override**, so an incomplete higher kit (e.g. a winget WDK with no matching SDK → missing `specstrings.h`) breaks the build. Keep only complete kits.
-- **LLVM 17.0.6** at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it for bindgen (LLVM 18 has a bindgen bug).
+- **LLVM 17.0.6** at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it for bindgen (LLVM 18 has a bindgen bug). bindgen/LLVM is needed only for any virtio-gpu PCI/MMIO (and WDF) header bindings — NOT for the old display DDIs, which no longer exist under KMDF.
 - **Rust nightly + `rust-src`** (for `no_std` build-std), target `x86_64-pc-windows-msvc`.
 - **cargo-make** — `cargo install --locked cargo-make`.
 - **coreutils** are installed (Unix tools like `ls`/`cp`/`grep` work in `win_exec`).
@@ -249,7 +249,7 @@ On the dev VM, generate a test certificate:
 mkdir helios-vgpu
 cd helios-vgpu
 
-# KMD — kernel-mode driver (WDM, no_std)
+# KMD — kernel-mode driver (KMDF System-class, no_std)
 cargo new kmd --lib
 cd kmd
 ```
@@ -266,7 +266,11 @@ build = "build.rs"
 crate-type = ["cdylib"]
 
 [package.metadata.wdk.driver-model]
-driver-type = "WDM"
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
+# driver-type = "KMDF" flips the generated INF Class from Display to System
+# {4d36e97d-e325-11ce-bfc1-08002be10318}.
 
 [dependencies]
 wdk = "0.4.0"
@@ -375,7 +379,15 @@ pnputil /add-driver helios_kmd.inf /install
 devcon install helios_kmd.inf "PCI\VEN_1AF4&DEV_1050"
 ```
 
-Check Device Manager → the device should appear under "Display adapters" as "Helios vGPU Render Adapter".
+Check Device Manager → the device should appear under "System devices" (System
+class {4d36e97d-e325-11ce-bfc1-08002be10318}), NOT under "Display adapters". There
+is no display adapter and no Code 43 — this is a System-class KMDF function driver,
+not a WDDM miniport.
+
+Verify the device interface is reachable from user mode (this is how the ICD finds
+the KMD): `SetupDiGetClassDevs(&GUID_DEVINTERFACE_HELIOS, ...)` →
+`SetupDiEnumDeviceInterfaces` → `SetupDiGetDeviceInterfaceDetail` → `CreateFile` on
+the returned device path should succeed.
 
 Check for errors:
 ```powershell
@@ -399,11 +411,12 @@ On the dev machine, open WinDbg and connect:
 File → Attach to Kernel → Net → Port: 50001, Key: 1.1.1.1
 ```
 
-Useful WinDbg commands for graphics driver debugging:
+Useful WinDbg commands for KMDF driver debugging:
 ```
-!dxgkrnl           # show DXGK state
-!dxgkrnl adapter   # list adapters
-lm m helios*       # check driver is loaded
+!wdfkd                       # load the WDF debugger extension
+!wdfkd.wdfldr                # show loaded WDF drivers / framework versions
+!wdfkd.wdfdevice             # inspect our WDFDEVICE (context, queues, interrupts)
+lm m helios*                 # check driver is loaded
 !devnode 0 1 "PCI\VEN_1AF4"  # find our device node
 .reload /f helios_kmd.sys    # load symbols
 ```
@@ -439,7 +452,7 @@ export VIRGL_LOG_LEVEL=debug
 | QEMU | 9.2.0 | Latest | Venus upstreamed in 9.2 |
 | virglrenderer | 1.1.0 | Latest | Build from source with -Dvenus=true |
 | Mesa (Linux guest test) | 24.2 | Latest | Venus ICD |
-| WDK | 22H2 (10.0.22621) | Latest | For WDDM 2.6 DDIs |
+| WDK | 10.0.26100.0 | 10.0.26100.0 | For KMDF/WDF (KMDF 1.33) |
 | VS | 2022 | 2022 | Earlier versions may work |
 | LLVM | 17.0.6 | 17.0.6 | 18 has bindgen bug, avoid |
 | Rust | nightly-2024-11+ | Latest nightly | 2024 edition |
@@ -455,22 +468,6 @@ Fix: Build inside "x64 Native Tools Command Prompt for VS 2022".
 
 ### bindgen fails with LLVM error
 LLVM 18 has a known bug. Downgrade to 17.0.6.
-
-### "DRIVER_INITIALIZATION_DATA not found"
-`wdk-sys` doesn't include display DDI headers by default for some configs.  
-Fix: the snippet that used to be here was **wrong** — `wdk-sys` has no display `ApiSubset` and there is **no `with_additional_headers` method**. Generate the display DDIs yourself with custom bindgen in the KMD `build.rs`, and link `displib.lib` (which provides `DxgkInitialize`):
-```rust
-use wdk_build::{BuilderExt, Config};
-let bindings = bindgen::Builder::wdk_default(Config::from_env_auto()?)?
-    .header_contents("dxgk.h", "#include <ntddk.h>\n#include <dispmprt.h>\n#include <d3dkmddi.h>\n")
-    .allowlist_type("DXGK.*").allowlist_function("Dxgk.*") // + D3DKMT_*, blocklist base types
-    .raw_line("pub use wdk_sys::*;")                       // base NT types from wdk-sys
-    .generate()?;
-bindings.write_to_file(/* $OUT_DIR/dxgk_bindings.rs */)?;
-Config::from_env_auto()?.configure_binary_build()?;
-println!("cargo:rustc-link-lib=static=displib");          // DxgkInitialize lives here
-```
-`bindgen` must be **0.71** (match `wdk-build`, so `BuilderExt::wdk_default` applies). See `kmd/build.rs` for the full working version.
 
 ### KMD loads but crashes on start
 Check IRQL. A common mistake is calling pageable functions at DISPATCH_LEVEL during virtqueue init. Use `KeGetCurrentIrql()` assertions in debug.

@@ -1,5 +1,7 @@
 # ICD.md — Vulkan ICD Implementation Guide
 
+> **⚠️ The HAND-WRITTEN ICD described below is SUPERSEDED by a port of Mesa's `venus` driver** (ARCH.md §5; `mesa-venus-icd-port` memory). The chosen ICD reuses Mesa's mature, byte-correct `vn_protocol_driver_*` Venus encoder and adds only a `vn_renderer_helios.c` backend over the IOCTL channel — we do **not** hand-roll the encoder. Treat the encoder/instance/device sections here as background. What REMAINS authoritative is the **ICD↔KMD contract**: the Vulkan-loader registration (Khronos registry JSON), the required `vk_icd*` exports, and the `DeviceIoControl` / `GUID_DEVINTERFACE_HELIOS` transport (§2.2) that `vn_renderer_helios.c` drives.
+
 ## Overview
 
 The Helios ICD (`helios_icd.dll`) is a **Vulkan Installable Client Driver** — a DLL that the Vulkan loader (`vulkan-1.dll`) loads when an application calls `vkCreateInstance`. The ICD implements the Vulkan API by encoding calls into the Venus protocol and submitting them to the KMD.
@@ -35,7 +37,7 @@ HKLM\SOFTWARE\Khronos\Vulkan\Drivers\
   "C:\Windows\System32\helios_vulkan.json" = DWORD:0
 ```
 
-Or via the INF's `AddReg` section (KMD handles this on install).
+The KMD is a System-class KMDF universal INF, which **cannot write absolute `HKLM` values** — so the **ICD installer (or a postinstall script) writes this Khronos Vulkan Drivers registry value**, independent of the KMD INF. (Precedent: lavapipe and SwiftShader register via exactly this mechanism with no display adapter.)
 
 ### 1.2 Required ICD Exports
 
@@ -122,7 +124,7 @@ pub extern "C" fn vk_create_instance(
 ) -> VkResult {
     let create_info = unsafe { &*p_create_info };
 
-    // 1. Open the KMD device via D3DKMT
+    // 1. Open the KMD device interface (SetupDi + CreateFile, see §2.2)
     let kmd = match KmdConnection::open() {
         Ok(k) => k,
         Err(_) => return VkResult::ERROR_INITIALIZATION_FAILED,
@@ -162,36 +164,78 @@ pub extern "C" fn vk_create_instance(
 
 ### 2.2 KMD Connection
 
-```rust
-// src/transport.rs — D3DKMT communication
+> **Transport: the KMD is a System-class KMDF driver, reached by `DeviceIoControl` on the device interface `GUID_DEVINTERFACE_HELIOS` — NOT `D3DKMT`/dxgkrnl.** There is no adapter, no device handle, no escape carrier. The ICD discovers the device with `SetupDiGetClassDevs` + `CreateFile`, then issues vendor IOCTLs whose input/output buffers carry the unchanged `helios_protocol` op structs. The six ops keep their exact wire layout; only the transport changes.
 
-// NOTE: the D3DKMT* thunks live under windows::Wdk (kernel-adjacent), NOT Win32.
-// Enable the `Wdk_Graphics_Direct3D` cargo feature of the `windows` crate.
-use windows::Wdk::Graphics::Direct3D::*;
+```rust
+// src/transport.rs — KMDF DeviceIoControl communication
+
+// We discover the KMD's device interface and open a HANDLE to it, then
+// issue vendor IOCTLs. No D3DKMT/dxgkrnl involvement.
+use windows::Win32::Devices::DeviceAndDriverInstallation::*; // SetupDiGetClassDevs, ...
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::CreateFileW;
+use windows::Win32::System::IO::DeviceIoControl;
+
+// CTL_CODE(DeviceType, Function, Method, Access)
+//   = (DeviceType<<16) | (Access<<14) | (Function<<2) | Method
+// DeviceType = FILE_DEVICE_UNKNOWN (0x22), Access = FILE_ANY_ACCESS (0),
+// Methods: BUFFERED=0, IN_DIRECT=1, OUT_DIRECT=2, NEITHER=3. (ARCH.md §3)
+const IOCTL_HELIOS_CTX_CREATE:   u32 = 0x0022_2400; // fn 0x900, BUFFERED
+const IOCTL_HELIOS_CTX_DESTROY:  u32 = 0x0022_2404; // fn 0x901, BUFFERED
+const IOCTL_HELIOS_SUBMIT_VENUS: u32 = 0x0022_2409; // fn 0x902, IN_DIRECT
+const IOCTL_HELIOS_ALLOC_BLOB:   u32 = 0x0022_240C; // fn 0x903, BUFFERED
+const IOCTL_HELIOS_MAP_BLOB:     u32 = 0x0022_2412; // fn 0x904, OUT_DIRECT
+const IOCTL_HELIOS_WAIT_FENCE:   u32 = 0x0022_2414; // fn 0x905, BUFFERED
 
 pub struct KmdConnection {
-    adapter_handle: D3DKMT_HANDLE,
-    device_handle:  D3DKMT_HANDLE,
-    fence_counter:  std::sync::atomic::AtomicU64,
+    device:        HANDLE,
+    fence_counter: std::sync::atomic::AtomicU64,
 }
 
 impl KmdConnection {
     pub fn open() -> Result<Self, KmdError> {
-        // 1. Enumerate adapters to find our VEN_1AF4&DEV_1050 adapter
-        let adapter_handle = find_helios_adapter()?;
+        // 1. Enumerate the present devices exposing GUID_DEVINTERFACE_HELIOS.
+        let dev_info = unsafe {
+            SetupDiGetClassDevsW(
+                Some(&helios_protocol::GUID_DEVINTERFACE_HELIOS),
+                None,
+                None,
+                DIGCF_DEVICEINTERFACE | DIGCF_PRESENT,
+            )
+        }?;
 
-        // 2. Open a device on that adapter
-        let mut open_adapter = D3DKMT_OPENADAPTERFROMLUID::default();
-        // ... fill in adapter LUID from enumeration
+        // 2. Grab the first interface and resolve its device path.
+        let mut iface = SP_DEVICE_INTERFACE_DATA {
+            cbSize: core::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            SetupDiEnumDeviceInterfaces(
+                dev_info,
+                None,
+                &helios_protocol::GUID_DEVINTERFACE_HELIOS,
+                0,
+                &mut iface,
+            )
+        }?;
+        // SetupDiGetDeviceInterfaceDetailW: first call sizes, second fills `path`.
+        let path: Vec<u16> = get_device_interface_detail(dev_info, &mut iface)?;
 
-        // 3. Create a D3DKMT device
-        let mut create_device = D3DKMT_CREATEDEVICE::default();
-        create_device.hAdapter = adapter_handle;
-        unsafe { D3DKMTCreateDevice(&mut create_device) }?;
+        // 3. Open a HANDLE to the device.
+        let device = unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(path.as_ptr()),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        }?;
 
         Ok(Self {
-            adapter_handle,
-            device_handle: create_device.hDevice,
+            device,
             fence_counter: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -202,33 +246,41 @@ impl KmdConnection {
         fence_id: u64,
         venus_data: &[u8],
     ) -> Result<(), KmdError> {
-        // Build escape buffer: header + payload + venus data
-        let payload_size = core::mem::size_of::<HeliosEscapeSubmitVenus>() + venus_data.len();
-        let mut escape_buf = vec![0u8; payload_size];
+        // Build the IOCTL input buffer: header + payload + venus data.
+        // Byte layout is IDENTICAL to the old escape path — only the carrier
+        // changed — so `helios_protocol`'s op struct is unchanged.
+        let payload_size = core::mem::size_of::<HeliosSubmitVenusReq>() + venus_data.len();
+        let mut ioctl_buf = vec![0u8; payload_size];
 
         let header = unsafe {
-            &mut *(escape_buf.as_mut_ptr() as *mut HeliosEscapeSubmitVenus)
+            &mut *(ioctl_buf.as_mut_ptr() as *mut HeliosSubmitVenusReq)
         };
         header.hdr.magic    = 0x48454C53;
-        header.hdr.cmd_type = HELIOS_ESCAPE_SUBMIT_VENUS;
+        header.hdr.cmd_type = IOCTL_HELIOS_SUBMIT_VENUS;
         header.hdr.version  = 1;
         header.hdr.size     = payload_size as u32;
         header.ctx_id       = ctx_id;
         header.fence_id     = fence_id;
         header.buffer_size  = venus_data.len() as u32;
 
-        let data_offset = core::mem::size_of::<HeliosEscapeSubmitVenus>();
-        escape_buf[data_offset..].copy_from_slice(venus_data);
+        let data_offset = core::mem::size_of::<HeliosSubmitVenusReq>();
+        ioctl_buf[data_offset..].copy_from_slice(venus_data);
 
-        // Call D3DKMTEscape
-        let mut escape = D3DKMT_ESCAPE::default();
-        escape.hAdapter = self.adapter_handle;
-        escape.hDevice  = self.device_handle;
-        escape.Type     = D3DKMT_ESCAPETYPE::D3DKMT_ESCAPE_DRIVERPRIVATE;
-        escape.pPrivateDriverData     = escape_buf.as_mut_ptr() as *mut _;
-        escape.PrivateDriverDataSize  = escape_buf.len() as u32;
-
-        unsafe { D3DKMTEscape(&escape) }?;
+        // Issue the IOCTL. METHOD_IN_DIRECT delivers the variable payload via a
+        // locked MDL; no output buffer.
+        let mut bytes: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                self.device,
+                IOCTL_HELIOS_SUBMIT_VENUS,
+                Some(ioctl_buf.as_ptr() as *const _),
+                ioctl_buf.len() as u32,
+                None,
+                0,
+                Some(&mut bytes),
+                None,
+            )
+        }?;
         Ok(())
     }
 
@@ -237,10 +289,23 @@ impl KmdConnection {
     }
 
     pub fn wait_fence(&self, fence_id: u64, timeout_ns: u64) -> Result<(), KmdError> {
-        // Use D3DKMTWaitForSynchronizationObjectFromCpu or
-        // poll monitored fence value (mapped user-mode VA)
-        // STUB: implement proper wait
-        std::thread::sleep(std::time::Duration::from_micros(100));
+        // IOCTL_HELIOS_WAIT_FENCE (BUFFERED): the KMD blocks on the per-fence
+        // KEVENT (fence_id -> KEVENT table) up to timeout_ns, then completes.
+        // STUB: wire the real HeliosWaitFence request struct.
+        let req = HeliosWaitFence { fence_id, timeout_ns };
+        let mut bytes: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                self.device,
+                IOCTL_HELIOS_WAIT_FENCE,
+                Some(&req as *const _ as *const _),
+                core::mem::size_of::<HeliosWaitFence>() as u32,
+                None,
+                0,
+                Some(&mut bytes),
+                None,
+            )
+        }?;
         Ok(())
     }
 }
@@ -347,8 +412,8 @@ Implement in this order (each enables more test coverage):
 - [ ] `vkCmdDrawIndexed` / `vkCmdDraw`
 - [ ] `vkCmdCopyBuffer` / `vkCmdCopyImage`
 
-### Tier 5: Swapchain (for DXVK Present)
-For render-only adapter, the swapchain extension may not be needed — DXVK's Present path goes back through the software renderer / display driver. Confirm this with DXVK's source.
+### Tier 5: Presentation (deferred — headless-first)
+Helios is **headless-first**: `vulkaninfo` and offscreen `vkcube` need no WSI/swapchain at all, so this tier is deferred. There is no WDDM Present path to fall back to (the KMD is not a display driver). If windowed presentation is ever required, it is a **GDI `StretchDIBits` readback** from a mapped host-visible blob into a window DC (the mvisor pattern) — the ICD reads the rendered image out of a `MAP_BLOB` user VA and blits it — NOT a swapchain/`vkQueuePresentKHR` flip through a display driver.
 
 ---
 
@@ -358,7 +423,7 @@ Venus supports a large set of Vulkan extensions. Expose the ones DXVK requires:
 
 **Minimum for DXVK 2.x:**
 ```
-VK_KHR_swapchain (may be optional for render-only)
+VK_KHR_swapchain (may be optional — headless-first, no WSI)
 VK_KHR_maintenance1/2/3/4
 VK_KHR_shader_draw_parameters
 VK_EXT_vertex_attribute_divisor
@@ -415,6 +480,6 @@ Key interface version history:
 | 3 | `vk_icdNegotiateLoaderICDInterfaceVersion` |
 | 4 | `vk_icdGetPhysicalDeviceProcAddr` |
 | 5 | Loader calls `vk_icdGetInstanceProcAddr(NULL, "vkGetInstanceProcAddr")` |
-| 6 | `vk_icdEnumerateAdapterPhysicalDevices` (DXGI adapter ordering) |
+| 6 | `vk_icdEnumerateAdapterPhysicalDevices` (DXGI adapter ordering) — **N/A for Helios**: a non-WDDM ICD does not participate in DXGI adapter ordering; the loader enumerates it purely via the `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` JSON manifest (no PnP/WDDM association). |
 
 Target version 5 minimum.

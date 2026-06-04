@@ -2,35 +2,30 @@
 
 ## Overview
 
-The KMD (Kernel-Mode Driver) is a WDDM 2.x **render-only display miniport driver**. It lives in the Windows kernel, talks to the virtio-gpu PCI device, and exposes a GPU adapter to the Windows graphics stack.
+The KMD (Kernel-Mode Driver) is a **System-class KMDF function driver** for the virtio-gpu PCI device. It lives in the Windows kernel, talks to the virtio-gpu device, and exposes the virtio-gpu Venus transport to user mode via a **DeviceIoControl device interface** (`GUID_DEVINTERFACE_HELIOS`). It is **not** a display/WDDM miniport: there is no dxgkrnl, no GPU-VA / segment / monitored-fence contract, and no user-mode display driver. The Vulkan ICD (a Windows port of Mesa's `venus`) reaches the KMD purely through IOCTLs on that device interface, and is enumerated independently by the Windows Vulkan loader via the Khronos registry JSON.
+
+See `ARCH.md` (canonical) for the full v2 architecture; this guide is the implementation companion for the `kmd/` crate.
 
 **References:**
-- WDDM initialization: https://learn.microsoft.com/en-us/windows-hardware/drivers/display/initializing-display-miniport-and-user-mode-display-drivers
-- DDI reference index: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/_display/
-- DRIVER_INITIALIZATION_DATA: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dispmprt/ns-dispmprt-_driver_initialization_data
-- Render-only adapter: https://learn.microsoft.com/en-us/windows-hardware/drivers/display/render-only-display-drivers
+- KMDF getting started: https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/getting-started-with-kmdf
+- WdfDriverCreate: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfdriver/nf-wdfdriver-wdfdrivercreate
+- WdfDeviceCreateDeviceInterface: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfdevice/nf-wdfdevice-wdfdevicecreatedeviceinterface
+- EvtIoDeviceControl: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfio/nc-wdfio-evt_wdf_io_queue_io_device_control
 
 ---
 
 ## ⚠️ Implementation Reality (read before the code below)
 
-The code in this guide was written **before** implementation and is wrong in several load-bearing ways. The working, building source under `kmd/` is the ground truth — prefer it over the snippets below. Key corrections (all confirmed against the WDK 10.0.26100 bindings + a driver that compiles, links, and packages):
+The working, building source under `kmd/` is the ground truth — prefer it over the snippets below. Key facts for the System-class KMDF model (confirmed against the WDK 10.0.26100 / KMDF 1.33 bindings):
 
-- **No display DDIs in `wdk-sys`.** It has no display `ApiSubset`, so `DRIVER_INITIALIZATION_DATA`, `DXGKRNL_INTERFACE`, every `DXGK*`/`DXGKARG_*`, and `DxgkInitialize` are **absent**. `build.rs` runs **custom bindgen** over `dispmprt.h`+`d3dkmddi.h` → `$OUT_DIR/dxgk_bindings.rs`, surfaced by `src/dxgk.rs` (which also `pub use wdk_sys::*;`). Use `use crate::dxgk::*;`, not `use wdk_sys::*`, for DDI types. `bindgen` must be **0.71** (match `wdk-build`, so `BuilderExt::wdk_default` applies).
-- **Link `displib.lib`.** `DxgkInitialize` lives there; `wdk-build` doesn't link it. `build.rs` needs `println!("cargo:rustc-link-lib=static=displib");` or it's an unresolved external.
-- **Panic handler:** do **not** define your own `#[panic_handler]` — just `extern crate wdk_panic;` (it supplies one; a second is a duplicate lang item). `wdk_panic::default_panic_handler` / `PanicHandler` are not real API.
-- **DriverEntry:** `DxgkInitialize`'s 3rd arg is `*mut DRIVER_INITIALIZATION_DATA` → `let mut init = build_ddi_table(); DxgkInitialize(.., &mut init)`. Zero-init via `core::mem::zeroed()` (it has no `Default`).
-- **Version fields:** `data.Version = DXGKDDI_INTERFACE_VERSION` (the symbol). The note's hex is wrong — WDDM2_0 is `0x5023`, not `0x7002`. `DXGK_DRIVERCAPS.WDDMVersion` must be **0** (reserved for `>= WIN7` drivers), not `KMT_DRIVERVERSION_WDDM_2_0`.
-- **`DXGK_DRIVERCAPS`:** there is **no** `PresentationCaps.NoScanout` (render-only = report 0 sources, not a cap bit). `SupportNonVGA` is a plain `BOOLEAN` field. You **must** also fill `MemoryManagementCaps` with `VirtualAddressingSupported=1` + `GpuMmuSupported=1` to actually advertise GPU VA.
-- **`DXGK_QUERYSEGMENTOUT4`:** count field is `NbSegment` (not `SegmentCount`); set `SegmentDescriptorStride` (u64); `pSegmentDescriptor` is `*mut u8` → cast to `*mut DXGK_SEGMENTDESCRIPTOR4`; flags via the bindgen union: `seg.Flags.__bindgen_anon_1.__bindgen_anon_1.set_CpuVisible(1)`/`set_Aperture(1)`.
-- **bindgen enum-modules:** `DXGK_QUERYADAPTERINFOTYPE`, `POWER_ACTION`, `DXGK_WDDMVERSION`, … are modules — use `::Type` for the type and module constants for values (e.g. `_DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_DRIVERCAPS`). `DispatchIoRequest`'s 3rd arg is `PVIDEO_REQUEST_PACKET`.
-- **Render-path DDIs:** for the runtime to create a device on the adapter, also register (stubs returning `STATUS_NOT_IMPLEMENTED` are fine, but the slots must be non-NULL): `Render`/`RenderKm`, `Patch`, `OpenAllocation`/`CloseAllocation`, `DescribeAllocation`, `GetStandardAllocationDriverData`, `GetNodeMetadata`, `SetRootPageTable`/`GetRootPageTableSize`, `CollectDbgInfo`, `ControlInterrupt`, `QueryCurrentFence`.
+- **KMDF only — `wdk-sys` + WDF, no display bindgen.** The driver uses the WDF function table that `wdk-sys` auto-wires; calls go through `wdk_sys::call_unsafe_wdf_function_binding!`. There is **no** `dispmprt.h`/`d3dkmddi.h` bindgen, **no** `src/dxgk.rs`, and **no** `cargo:rustc-link-lib=static=displib`. `build.rs` collapses to `Config::from_env_auto()?.configure_binary_build()?`. None of `DxgkInitialize`, `DRIVER_INITIALIZATION_DATA`, `DXGKDDI_INTERFACE_VERSION`, `DXGK_DRIVERCAPS`, the QUERYSEGMENT/GPUMMU caps, the render-DDI list, or any `DXGK*` symbol is used — that whole surface, plus Code 43 and the AddAdapter capability/version handshake, is gone. Use `use wdk_sys::*;` for kernel types.
+- **`Cargo.toml` driver-type is `KMDF`** with `kmdf-version` set (1.33); the bindgen build-dependency is dropped.
+- **Panic handler:** do **not** define your own `#[panic_handler]` — just `extern crate wdk_panic;` (it supplies one; a second is a duplicate lang item).
 - **Build on local disk, never `Z:\`** (cargo/wdk IO fails on the 9p share — OS error 87, windows-drivers-rs#481): the `win` MCP `win_cargo` tool robocopy-mirrors to `C:\Users\Rupansh\helios-vgpu` and builds there. See TOOLCHAIN.md.
-- **Driver model:** WDDM 2.0 **render-only graphics** miniport (NULL all VidPN DDIs, 0 sources) — *not* MCDM (`ComputeAccelerator`/`ComputeOnly`), which is the compute model and would risk the 3D-graphics path. See OVERVIEW.md "Driver Model & WDDM Targeting".
 
 ---
 
-## Phase 1: DriverEntry and DDI Table
+## Phase 1: DriverEntry and KMDF Skeleton
 
 ### 1.1 `src/lib.rs` — Entry Point
 
@@ -41,7 +36,7 @@ The code in this guide was written **before** implementation and is wrong in sev
 extern crate alloc;
 
 use wdk_alloc::WdkAllocator;
-use wdk_panic::PanicHandler;
+extern crate wdk_panic; // supplies the #[panic_handler]; do NOT define a second one
 use wdk_sys::{
     ntddk::*,
     *,
@@ -51,22 +46,11 @@ use wdk_sys::{
 #[global_allocator]
 static ALLOCATOR: WdkAllocator = WdkAllocator;
 
-// Required: panic handler (calls KeBugCheck, never returns)
-#[panic_handler]
-fn panic_handler(info: &core::panic::PanicInfo) -> ! {
-    // SAFETY: KeBugCheck terminates the system; this is correct for kernel panics.
-    unsafe { wdk_panic::default_panic_handler(info) }
-}
-
 mod adapter;
-mod device;
 mod interrupt;
-mod memory;
-mod scheduler;
+mod ioctl;
+mod pnp;
 mod virtio;
-mod ddi;
-
-use ddi::*;
 
 /// DriverEntry: registered in the INF as the driver entrypoint.
 /// Called by the OS when the driver is first loaded.
@@ -76,109 +60,94 @@ use ddi::*;
 #[export_name = "DriverEntry"]
 pub unsafe extern "system" fn driver_entry(
     driver_object: *mut DRIVER_OBJECT,
-    registry_path: *const UNICODE_STRING,
+    registry_path: *mut UNICODE_STRING,
 ) -> NTSTATUS {
-    // SAFETY: Dxgkrnl guarantees driver_object and registry_path are valid.
+    // Build the WDF driver config with our single PnP callback,
+    // then hand off to the framework. No DDI table — KMDF wires
+    // PnP/power/IO through the WDF object model.
+    let mut config = WDF_DRIVER_CONFIG {
+        Size: core::mem::size_of::<WDF_DRIVER_CONFIG>() as u32,
+        EvtDriverDeviceAdd: Some(pnp::evt_device_add),
+        ..unsafe { core::mem::zeroed() }
+    };
+
+    // SAFETY: driver_object and registry_path are valid for the call; the WDF
+    //         function-table macro forwards to the framework's WdfDriverCreate.
     let status = unsafe {
-        DxgkInitialize(driver_object, registry_path, &build_ddi_table())
+        call_unsafe_wdf_function_binding!(
+            WdfDriverCreate,
+            driver_object,
+            registry_path,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &mut config,
+            WDF_NO_HANDLE as *mut _,
+        )
     };
     status
 }
+```
 
-fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
-    // Zero-initialize, then fill in what we support.
-    // Render-only: display DDIs are left as NULL.
-    let mut data = DRIVER_INITIALIZATION_DATA::default();
+`evt_device_add` (in `pnp.rs`) builds the device object, registers the IOCTL device interface, and creates the default IO queue:
 
-    // Required: WDDM version we're targeting (2.0 = Windows 10)
-    // DXGKDDI_INTERFACE_VERSION_WDDM2_0 = 0x7002
-    data.Version = DXGKDDI_INTERFACE_VERSION as u32;
+```rust
+// src/pnp.rs (sketch)
 
-    // PnP / power lifecycle
-    data.DxgkDdiAddDevice             = Some(dxgkddi_add_device);
-    data.DxgkDdiStartDevice           = Some(dxgkddi_start_device);
-    data.DxgkDdiStopDevice            = Some(dxgkddi_stop_device);
-    data.DxgkDdiRemoveDevice          = Some(dxgkddi_remove_device);
-    data.DxgkDdiSetPowerState         = Some(dxgkddi_set_power_state);
-    data.DxgkDdiDispatchIoRequest     = Some(dxgkddi_dispatch_io_request);
-    data.DxgkDdiInterruptRoutine      = Some(dxgkddi_interrupt_routine);
-    data.DxgkDdiDpcRoutine            = Some(dxgkddi_dpc_routine);
+pub unsafe extern "C" fn evt_device_add(
+    _driver: WDFDRIVER,
+    device_init: PWDFDEVICE_INIT,
+) -> NTSTATUS {
+    // 1. PnP/power callbacks (prepare/release hardware, D0 entry/exit).
+    let mut pnp = WDF_PNPPOWER_EVENT_CALLBACKS {
+        Size: core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as u32,
+        EvtDevicePrepareHardware: Some(evt_device_prepare_hardware),
+        EvtDeviceReleaseHardware: Some(evt_device_release_hardware),
+        ..unsafe { core::mem::zeroed() }
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetPnpPowerEventCallbacks, device_init, &mut pnp);
+    }
 
-    // Adapter queries
-    data.DxgkDdiQueryChildRelations   = Some(dxgkddi_query_child_relations);
-    data.DxgkDdiQueryChildStatus      = Some(dxgkddi_query_child_status);
-    data.DxgkDdiQueryDeviceDescriptor = Some(dxgkddi_query_device_descriptor);
-    data.DxgkDdiQueryAdapterInfo      = Some(dxgkddi_query_adapter_info);
+    // 2. Typed context (AdapterContext) attached to the device object.
+    let mut attribs = WDF_OBJECT_ATTRIBUTES::default();
+    // WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(AdapterContext) equivalent…
 
-    // Device / context / allocation management
-    data.DxgkDdiCreateDevice          = Some(dxgkddi_create_device);
-    data.DxgkDdiDestroyDevice         = Some(dxgkddi_destroy_device);
-    data.DxgkDdiCreateAllocation      = Some(dxgkddi_create_allocation);
-    data.DxgkDdiDestroyAllocation     = Some(dxgkddi_destroy_allocation);
-    data.DxgkDdiCreateContext         = Some(dxgkddi_create_context);
-    data.DxgkDdiDestroyContext        = Some(dxgkddi_destroy_context);
+    // 3. Create the device.
+    let mut device: WDFDEVICE = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceCreate, &mut device_init, &mut attribs, &mut device)
+    };
+    if !nt_success(status) { return status; }
 
-    // Memory management / GPU VA
-    data.DxgkDdiBuildPagingBuffer     = Some(dxgkddi_build_paging_buffer);
+    // 4. Register the IOCTL device interface (auto-enables on D0).
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceCreateDeviceInterface,
+            device,
+            &helios_protocol::escape::GUID_DEVINTERFACE_HELIOS,
+            core::ptr::null_mut());
+    }
 
-    // Command submission (WDDM 2.0 uses SubmitCommandVirtual)
-    data.DxgkDdiSubmitCommandVirtual  = Some(dxgkddi_submit_command_virtual);
-    data.DxgkDdiPreemptCommand        = Some(dxgkddi_preempt_command);
-    data.DxgkDdiResetFromTimeout      = Some(dxgkddi_reset_from_timeout);
-    data.DxgkDdiRestartFromTimeout    = Some(dxgkddi_restart_from_timeout);
-
-    // Out-of-band ICD → KMD channel
-    data.DxgkDdiEscape                = Some(dxgkddi_escape);
-
-    // GPU Virtual Addressing (required for WDDM 2.0)
-    data.DxgkDdiCreateProcess         = Some(dxgkddi_create_process);
-    data.DxgkDdiDestroyProcess        = Some(dxgkddi_destroy_process);
-
-    // Display DDIs — all NULL for render-only adapter
-    // DxgkDdiSetVidPnSourceAddress      = None (default)
-    // DxgkDdiRecommendFunctionalVidPn   = None
-    // ... etc.
-
-    data
+    // 5. Default parallel IO queue dispatching EvtIoDeviceControl.
+    let mut queue_config = WDF_IO_QUEUE_CONFIG::default(); // INIT_DEFAULT_QUEUE(Parallel)
+    queue_config.EvtIoDeviceControl = Some(crate::ioctl::evt_io_device_control);
+    let mut queue: WDFQUEUE = core::ptr::null_mut();
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoQueueCreate, device, &mut queue_config,
+            WDF_NO_OBJECT_ATTRIBUTES, &mut queue)
+    }
 }
 ```
 
-**Note on `DXGKDDI_INTERFACE_VERSION`:** For WDDM 2.0 you want `DXGKDDI_INTERFACE_VERSION_WDDM2_0`. Check `d3dkmddi.h` in the WDK for the exact value (`0x7002`). For WDDM 2.6 (Windows 10 1903+), use `DXGKDDI_INTERFACE_VERSION_WDDM2_6` (`0x9003`). Set the lowest version that gives you the DDIs you need — start with 2.0.
+There is **no** user-mode driver registration of any kind (no `UserModeDriverName`, no `OpenAdapter` handshake). The KMD exposes only the device interface; the Vulkan ICD is independent (registry JSON, see ARCH.md §7).
 
 ---
 
-## Phase 1: DxgkDdiAddDevice
+## Phase 1: evt_device_add — Device Context
 
-Called when the OS finds a device matching the INF's hardware ID. Allocate the adapter context.
-
-**Reference:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dispmprt/nc-dispmprt-dxgkddi_add_device
-
-```rust
-// src/ddi/add_device.rs
-
-use crate::adapter::AdapterContext;
-use wdk_sys::*;
-
-pub unsafe extern "C" fn dxgkddi_add_device(
-    physical_device_object: *const DEVICE_OBJECT,
-    miniport_device_context: *mut *mut core::ffi::c_void,
-) -> NTSTATUS {
-    // SAFETY: physical_device_object is a valid PDO from the PnP manager.
-    //         miniport_device_context is a valid out-pointer.
-
-    let ctx = match AdapterContext::new(physical_device_object) {
-        Ok(c) => c,
-        Err(e) => return e.into_ntstatus(),
-    };
-
-    // Box the context and leak it as a raw pointer.
-    // We will reclaim it in DxgkDdiRemoveDevice.
-    let raw = Box::into_raw(Box::new(ctx)) as *mut core::ffi::c_void;
-
-    unsafe { *miniport_device_context = raw };
-    STATUS_SUCCESS
-}
-```
+`evt_device_add` is called when the PnP manager binds the driver to a matching device. It creates the WDF device object and attaches the `AdapterContext` typed context. Retrieve the context anywhere via `WdfObjectGetTypedContext(device, AdapterContext::type_info())`.
 
 ```rust
 // src/adapter.rs
@@ -186,30 +155,27 @@ pub unsafe extern "C" fn dxgkddi_add_device(
 use wdk_sys::*;
 
 pub struct AdapterContext {
-    /// The physical device object (PDO) for the virtio-gpu device
-    pub pdo: *const DEVICE_OBJECT,
-    /// Kernel interface callbacks (filled by DxgkDdiStartDevice)
-    pub dxgkrnl: Option<DXGKRNL_INTERFACE>,
-    /// VirtIO device state
+    /// VirtIO device state, guarded by an internal spinlock.
     pub virtio: Option<crate::virtio::VirtioGpu>,
-    /// Fence sequence counter
+    /// Spinlock guarding `virtio` for parallel IOCTL / DPC access.
+    pub virtio_lock: KSPIN_LOCK,
+    /// Fence sequence counter.
     pub fence_seq: u64,
+    /// fence_id -> KEVENT table for the async WAIT_FENCE path.
+    pub fences: crate::adapter::FenceTable,
 }
 
-// SAFETY: The kernel guarantees single-threaded access during init DDIs.
-// For concurrent access, we'll add spinlocks later.
+// SAFETY: the spinlock serializes access to `virtio`; the fence table is
+// likewise lock-guarded. WDF owns the context's lifetime.
 unsafe impl Send for AdapterContext {}
 unsafe impl Sync for AdapterContext {}
 
 impl AdapterContext {
-    pub fn new(pdo: *const DEVICE_OBJECT) -> Result<Self, DriverError> {
-        Ok(Self {
-            pdo,
-            dxgkrnl: None,
-            virtio: None,
-            fence_seq: 0,
-        })
-    }
+    /// `with_virtio` runs a closure under `virtio_lock`; `set_virtio` installs
+    /// or clears the transport during prepare/release hardware.
+    pub fn with_virtio<R>(&self, f: impl FnOnce(&mut crate::virtio::VirtioGpu) -> R)
+        -> Result<R, DriverError> { /* acquire virtio_lock, run f */ todo!() }
+    pub fn set_virtio(&mut self, v: Option<crate::virtio::VirtioGpu>) { /* … */ }
 }
 
 pub enum DriverError {
@@ -231,199 +197,92 @@ impl DriverError {
 }
 ```
 
+The context **drops** the WDDM-era `dxgkrnl: Option<DXGKRNL_INTERFACE>` field and the `pdo`/`dxgkrnl()` accessor — no Dxgkrnl exists under KMDF. It **adds** the `fence_id -> KEVENT` table consumed by `WAIT_FENCE` (signalled from the interrupt DPC).
+
 ---
 
-## Phase 1: DxgkDdiStartDevice
+## Phase 1: EvtDevicePrepareHardware / EvtDeviceReleaseHardware
 
-The most critical initialization DDI. Maps hardware resources, saves the kernel interface.
+`EvtDevicePrepareHardware` is the critical initialization callback — it maps hardware resources and brings up the transport. KMDF hands it the raw and translated CM resource lists.
 
-**Reference:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dispmprt/nc-dispmprt-dxgkddi_start_device
+**Reference:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfdevice/nc-wdfdevice-evt_wdf_device_prepare_hardware
 
 ```rust
-// src/ddi/start_device.rs
+// src/pnp.rs
 
-pub unsafe extern "C" fn dxgkddi_start_device(
-    miniport_device_context: *mut core::ffi::c_void,
-    dxgk_start_info: *const DXGK_START_INFO,
-    dxgkrnl_interface: *const DXGKRNL_INTERFACE,
-    number_of_video_present_sources: *mut u32,
-    number_of_children: *mut u32,
+pub unsafe extern "C" fn evt_device_prepare_hardware(
+    device: WDFDEVICE,
+    _resources_raw: WDFCMRESLIST,
+    resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
-    // SAFETY: All pointers guaranteed valid by Dxgkrnl contract.
-    let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
-    let dxgkrnl = unsafe { &*dxgkrnl_interface };
+    let adapter = unsafe { &mut *adapter_context(device) };
 
-    // 1. Save Dxgkrnl callbacks — we need these for the entire driver lifetime.
-    adapter.dxgkrnl = Some(unsafe { dxgkrnl.clone() });
-
-    // 2. Get device info (translated resource list, registry path, etc.)
-    let mut device_info = DXGK_DEVICE_INFO::default();
-    let status = unsafe {
-        (dxgkrnl.DxgkCbGetDeviceInformation)(
-            dxgkrnl.DeviceHandle,
-            &mut device_info,
-        )
+    // 1. Walk the translated resource list; map each memory BAR.
+    let count = unsafe {
+        call_unsafe_wdf_function_binding!(WdfCmResourceListGetCount, resources_translated)
     };
-    if status != STATUS_SUCCESS { return status; }
+    for i in 0..count {
+        let desc = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfCmResourceListGetDescriptor, resources_translated, i)
+        };
+        // SAFETY: desc points to a valid CM_PARTIAL_RESOURCE_DESCRIPTOR.
+        let desc = unsafe { &*desc };
+        if desc.Type == CmResourceTypeMemory as u8 {
+            // MmMapIoSpaceEx the BAR's Start/Length; record base for the cap scan.
+            // …
+        }
+    }
 
-    // 3. Initialize VirtIO GPU device
-    //    (maps PCI BARs, negotiates features, sets up virtqueues)
-    let virtio = match crate::virtio::VirtioGpu::init(&device_info) {
+    // 2. Obtain the PCI bus interface for config-space access.
+    let mut bus_if: BUS_INTERFACE_STANDARD = unsafe { core::mem::zeroed() };
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfFdoQueryForInterface,
+            device,
+            &GUID_BUS_INTERFACE_STANDARD,
+            &mut bus_if as *mut _ as *mut INTERFACE,
+            core::mem::size_of::<BUS_INTERFACE_STANDARD>() as u16,
+            1, // version
+            core::ptr::null_mut())
+    };
+    if !nt_success(status) { return status; }
+
+    // 3. Bring up the transport over the config-access shim, then store it.
+    let cfg = crate::virtio::KmdfConfigAccess::new(bus_if);
+    let virtio = match crate::virtio::VirtioGpu::init(&cfg /* + mapped BARs */) {
         Ok(v) => v,
         Err(e) => return e.into_ntstatus(),
     };
-    adapter.virtio = Some(virtio);
-
-    // 4. Render-only: no video present sources, no children (no monitors)
-    unsafe {
-        *number_of_video_present_sources = 0;
-        *number_of_children = 0;
-    }
+    adapter.set_virtio(Some(virtio));
 
     STATUS_SUCCESS
 }
+
+pub unsafe extern "C" fn evt_device_release_hardware(
+    device: WDFDEVICE,
+    _resources_translated: WDFCMRESLIST,
+) -> NTSTATUS {
+    let adapter = unsafe { &mut *adapter_context(device) };
+    adapter.set_virtio(None);
+    // MmUnmapIoSpace each mapped BAR.
+    STATUS_SUCCESS
+}
 ```
+
+The WDF interrupt object is created here (or in `evt_device_add`) with `WdfInterruptCreate`; see Interrupt Handling below.
 
 ---
 
-## Phase 1: DxgkDdiQueryAdapterInfo
+## Capability advertisement is gone
 
-The most important capability DDI. Here we declare render-only support.
-
-**Reference:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_queryadapterinfo  
-**DXGK_DRIVERCAPS:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_drivercaps
-
-```rust
-// src/ddi/query_adapter_info.rs
-
-pub unsafe extern "C" fn dxgkddi_query_adapter_info(
-    miniport_device_context: *mut core::ffi::c_void,
-    query_adapter_info: *const DXGKARG_QUERYADAPTERINFO,
-) -> NTSTATUS {
-    let _adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
-    let args = unsafe { &*query_adapter_info };
-
-    match args.Type {
-        DXGKQAITYPE_DRIVERCAPS => query_driver_caps(args),
-        DXGKQAITYPE_QUERYSEGMENT4 => query_segments(args),
-        DXGKQAITYPE_GPUMMUCAPS => query_gpummu_caps(args),
-        // Return not-supported for everything else; Dxgkrnl handles it.
-        _ => STATUS_NOT_SUPPORTED,
-    }
-}
-
-fn query_driver_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
-    if args.OutputDataSize < core::mem::size_of::<DXGK_DRIVERCAPS>() as u32 {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: OutputData points to a DXGK_DRIVERCAPS buffer of sufficient size.
-    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_DRIVERCAPS) };
-    *caps = DXGK_DRIVERCAPS::default();
-
-    // ── Render capabilities ──────────────────────────────────────────────────
-    // PresentationCaps: we do NOT present (render-only)
-    caps.PresentationCaps.NoScanout = 1;        // no display output
-    caps.PresentationCaps.SupportKernelModeCommandBuffer = 0;
-
-    // SchedulingCaps: enable GPU preemption at DMA buffer level
-    caps.SchedulingCaps.MultiEngineAware = 0;   // one engine for now
-    caps.SchedulingCaps.VSyncPowerSaveAware = 0;
-
-    // FlipCaps: N/A for render-only (no flip/scanout)
-    // caps.FlipCaps stays zeroed
-
-    // GpuEngineTopology: one 3D engine
-    caps.GpuEngineTopology.NbAsyncEngineCount = 0;
-
-    // SupportNonVGA: yes, we're not a legacy VGA device
-    caps.SupportNonVGA = 1;
-
-    // SupportSmoothRotation: irrelevant for render-only
-    caps.SupportSmoothRotation = 0;
-
-    // SupportPerEngineTDR: report false for simplicity initially
-    caps.SupportPerEngineTDR = 0;
-
-    // WDDMVersion: must match the Version in DRIVER_INITIALIZATION_DATA
-    // For WDDM 2.0: DXGKDDI_WDDMVersion = KMT_DRIVERVERSION_WDDM_2_0 = 2000
-    caps.WDDMVersion = KMT_DRIVERVERSION_WDDM_2_0 as u32;
-
-    // MaxAllocationListSlotId: max resource IDs
-    caps.MaxAllocationListSlotId = 0xFFFF;
-
-    // ApertureSegmentCommitLimit: max bytes we allow committed in aperture
-    caps.ApertureSegmentCommitLimit = 512 * 1024 * 1024; // 512 MB
-
-    // HighestAcceptableAddress: 64-bit addressing
-    caps.HighestAcceptableAddress.QuadPart = !0i64;
-
-    STATUS_SUCCESS
-}
-
-fn query_segments(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
-    // WDDM 2.0 uses DXGK_QUERYSEGMENTOUT4
-    // We report one aperture segment backed by the virtio-gpu hostmem blob.
-    //
-    // An aperture segment is CPU-accessible memory — the guest can write
-    // into it, and the host virglrenderer reads from it.
-    if args.OutputDataSize < core::mem::size_of::<DXGK_QUERYSEGMENTOUT4>() as u32 {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-
-    // First call: Dxgkrnl sends pSegmentDescriptor = NULL to query count.
-    // We return SegmentCount = 1, PagingBufferSegmentId = 1.
-    let out = unsafe { &mut *(args.pOutputData as *mut DXGK_QUERYSEGMENTOUT4) };
-
-    if args.pInputData.is_null()
-        || (unsafe { &*(args.pInputData as *const DXGK_QUERYSEGMENTIN) }).AgpApertureBase == 0
-    {
-        // Second call: fill in the segment descriptor.
-        // For now, use 512 MB aperture at a host-provided physical address.
-        // The actual BAR address is filled in from the virtio-gpu hostmem region.
-        out.SegmentCount = 1;
-        out.PagingBufferSegmentId = 1;
-        out.PagingBufferSize = 64 * 1024; // 64 KB paging buffer
-        out.PagingBufferPrivateDataSize = 0;
-
-        // pSegmentDescriptor is an array of DXGK_SEGMENTDESCRIPTOR4
-        // Dxgkrnl allocates this; we just fill it.
-        if !out.pSegmentDescriptor.is_null() {
-            let seg = unsafe { &mut *out.pSegmentDescriptor };
-            // CPU-accessible aperture (the hostmem= region)
-            seg.Flags.CpuVisible = 1;
-            seg.Flags.Aperture = 1;
-            // Physical address from virtio-gpu BAR
-            // (filled later after PCI init — placeholder)
-            seg.BaseAddress.QuadPart = 0; // STUB: fill from VirtioGpu::hostmem_gpa
-            seg.Size = 512 * 1024 * 1024; // 512 MB
-            seg.CommitLimit = 512 * 1024 * 1024;
-        }
-    }
-    STATUS_SUCCESS
-}
-
-fn query_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
-    // GPU virtual addressing caps (WDDM 2.0 requirement)
-    // https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-virtual-memory-in-wddm-2-0
-    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_GPUMMUCAPS) };
-    *caps = DXGK_GPUMMUCAPS::default();
-
-    // 48-bit virtual address space (standard for x64)
-    caps.VirtualAddressBitCount = 48;
-    caps.PageTableLevelCount = 4;          // 4-level page table (PML4)
-    caps.LargePageSupported = 0;           // start simple
-    caps.DualPteSupported = 0;
-    caps.AllowNonAlignedLargePageAddress = 0;
-
-    STATUS_SUCCESS
-}
-```
+There is no `QueryAdapterInfo`/`DXGK_DRIVERCAPS`/segment/GpuMmu cap surface anymore — the host owns all GPU memory and scheduling under Venus replay, so the guest driver advertises nothing to a graphics stack. User mode reaches the device purely through the IOCTL interface below.
 
 ---
 
 ## Phase 2: VirtIO PCI Initialization
 
-> **STATUS (2026-06-04): Phase 2 COMPLETE — implemented via the `virtio-drivers` 0.13 crate, NOT the hand-rolled code in this section.** The `struct Virtqueue` + helpers below (`add_buffer`/`notify_head`/`poll_used`/`free_chain`/`desc_phys`, and the `VirtioGpuCmd*` redefinitions) **do not exist in the codebase** — they are reference-only prose. The real transport is `VirtQueue<WdkHal, 64>` + `PciTransport` in `kmd/src/virtio/{gpu,hal,config}.rs` (`WdkHal` impls `virtio_drivers::Hal`; `DxgkConfigAccess` impls `ConfigurationAccess` over `DxgkCbReadDeviceSpace`). Wire structs come from `helios_protocol`. `GET_DISPLAY_INFO` round-trips on real HW. See the `phase2-virtio-drivers` memory.
+> **STATUS (2026-06-04): Phase 2 COMPLETE — implemented via the `virtio-drivers` 0.13 crate, NOT the hand-rolled code in this section.** The `struct Virtqueue` + helpers below (`add_buffer`/`notify_head`/`poll_used`/`free_chain`/`desc_phys`, and the `VirtioGpuCmd*` redefinitions) **do not exist in the codebase** — they are reference-only prose. The real transport is `VirtQueue<WdkHal, 64>` + `PciTransport` in `kmd/src/virtio/{gpu,hal,config}.rs` (`WdkHal` impls `virtio_drivers::Hal`; `KmdfConfigAccess` impls `ConfigurationAccess` over a `BUS_INTERFACE_STANDARD` obtained from `WdfFdoQueryForInterface` — its `read_word`/`write_word` call `GetBusData`/`SetBusData` on `PCI_WHICHSPACE_CONFIG`). Wire structs come from `helios_protocol`. `GET_DISPLAY_INFO` round-trips on real HW. See the `phase2-virtio-drivers` memory.
 
 ### VirtIO PCI Device Layout
 
@@ -756,136 +615,153 @@ impl Virtqueue {
 
 ---
 
-## Phase 3: DxgkDdiSubmitCommandVirtual
+## Phase 3: IOCTL Interface
 
-> **ERRATA (2026-06-04): the Venus submit path is `DxgkDdiEscape` (D3DKMTEscape), NOT `DxgkDdiSubmitCommandVirtual`.** The Vulkan ICD's only kernel channel is the private escape protocol in `helios_protocol::escape` (CTX_CREATE / SUBMIT_VENUS / WAIT_FENCE / ...), which sidesteps GPU-VA. `DxgkDdiSubmitCommandVirtual` and `DxgkDdiSubmitCommand` MUST stay `STATUS_SUCCESS` no-ops — returning any error BugChecks 0x119. The `submit_3d_cmd(...)` body sketched below calls hand-rolled `Virtqueue` methods that no longer exist; the real submit lives in `VirtioGpu::submit_3d` (kmd/src/virtio/gpu.rs) over virtio-drivers `VirtQueue::{add_notify_wait_pop, add, pop_used}`. See the `phase3-kickoff` memory.
+User mode reaches the KMD through `DeviceIoControl` on the device interface `GUID_DEVINTERFACE_HELIOS` (defined once in `helios_protocol` so the KMD and the Vulkan ICD share the constant). The ICD discovers and opens it with `SetupDiGetClassDevs(DIGCF_DEVICEINTERFACE|DIGCF_PRESENT)` → `SetupDiEnumDeviceInterfaces` → `SetupDiGetDeviceInterfaceDetail` → `CreateFileW` → `DeviceIoControl`.
 
-This is the hot path — called for every GPU command buffer submission.
+The six wire ops keep their exact `helios_protocol` layout (`protocol/src/escape.rs`); they simply move from the old D3DKMTEscape carrier to IOCTL input/output buffers. The IOCTL **control code is the verb**, and WDF validates the in/out buffer lengths, so the 16-byte `HeliosEscapeHeader` (magic/cmd_type/version/size) becomes redundant — keep it only as an optional cheap version sanity check.
 
-**Reference:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_submitcommandvirtual
+### IOCTL constants
+
+`CTL_CODE(DeviceType, Function, Method, Access) = (DeviceType<<16)|(Access<<14)|(Function<<2)|Method`, with `DeviceType = FILE_DEVICE_UNKNOWN (0x22)`, `Access = FILE_ANY_ACCESS (0)`, function base `0x900` (vendor range), methods `BUFFERED=0 / IN_DIRECT=1 / OUT_DIRECT=2 / NEITHER=3`. The constants live in `helios_protocol::escape`:
+
+| Op | IOCTL constant | Value | Method |
+|----|----------------|-------|--------|
+| CTX_CREATE   | `IOCTL_HELIOS_CTX_CREATE`   | `0x00222400` | BUFFERED  |
+| CTX_DESTROY  | `IOCTL_HELIOS_CTX_DESTROY`  | `0x00222404` | BUFFERED  |
+| SUBMIT_VENUS | `IOCTL_HELIOS_SUBMIT_VENUS` | `0x00222409` | IN_DIRECT |
+| ALLOC_BLOB   | `IOCTL_HELIOS_ALLOC_BLOB`   | `0x0022240C` | BUFFERED  |
+| MAP_BLOB     | `IOCTL_HELIOS_MAP_BLOB`     | `0x00222412` | OUT_DIRECT |
+| WAIT_FENCE   | `IOCTL_HELIOS_WAIT_FENCE`   | `0x00222414` | BUFFERED  |
+
+**Method rationale:** small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers the system buffer). `SUBMIT_VENUS`'s Venus stream can be megabytes, so it uses `METHOD_IN_DIRECT`: a small fixed header (`ctx_id`/`fence_id`/`buffer_size`) rides the buffered system buffer while the variable Venus blob arrives as a locked MDL (`WdfRequestRetrieveInputWdmMdl`). `MAP_BLOB` returns a **user VA**, not a GPA: the kernel does `MmMapLockedPagesSpecifyCache(blobMdl, UserMode, …)` and writes the resulting user VA into the OUT buffer — hence the op struct field is `out_user_va` (renamed from the old `out_gpa`).
+
+### Dispatch
+
+`evt_io_device_control` switches on the control code, retrieves the buffers, runs the **same op bodies as before** against the transport, and completes the request:
 
 ```rust
-// src/ddi/submit_command.rs
+// src/ioctl.rs
 
-pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
-    miniport_device_context: *mut core::ffi::c_void,
-    submit_command: *const DXGKARG_SUBMITCOMMANDVIRTUAL,
-) -> NTSTATUS {
-    let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
-    let args = unsafe { &*submit_command };
-    let virtio = adapter.virtio.as_mut().unwrap();
+use helios_protocol::escape::*;
+use wdk_sys::*;
 
-    // The command buffer is a GPU virtual address in the process's GPU VA space.
-    // It contains Venus-encoded Vulkan commands assembled by the ICD.
-    //
-    // For WDDM 2.0 GPU VA model, we submit the GVA directly to the
-    // GPU (in our case, via virtio-gpu CMD_SUBMIT_3D).
-    //
-    // We store a pending submission and fire the virtqueue.
-    let fence_id = args.SubmissionFenceId;
-    let ctx_id   = args.hContext as u32; // STUB: extract proper ctx ID
+pub unsafe extern "C" fn evt_io_device_control(
+    queue: WDFQUEUE,
+    request: WDFREQUEST,
+    _output_buffer_length: usize,
+    _input_buffer_length: usize,
+    io_control_code: u32,
+) {
+    let device = unsafe {
+        call_unsafe_wdf_function_binding!(WdfIoQueueGetDevice, queue)
+    };
+    let adapter = unsafe { &mut *crate::pnp::adapter_context(device) };
 
-    // Allocate a VirtioGpuCmdSubmit header in the command ring
-    let cmd = crate::virtio::gpu::VirtioGpuCmdSubmit {
-        hdr: crate::virtio::gpu::VirtioGpuCtrlHdr {
-            type_:    crate::virtio::gpu::VIRTIO_GPU_CMD_SUBMIT_3D,
-            flags:    crate::virtio::gpu::VIRTIO_GPU_FLAG_FENCE,
-            fence_id: fence_id,
-            ctx_id:   ctx_id,
-            ring_idx: 0,
-            padding:  [0; 3],
-        },
-        size: args.DmaBufferSize,
-        padding: 0,
+    // Retrieve input/output buffers (buffered) or the input MDL (SUBMIT_VENUS),
+    // validating every guest-supplied size/offset against the WDF-reported
+    // lengths before use. Reads use bytemuck::pod_read_unaligned. This logic
+    // ports 1:1 from the former escape handler.
+    let (status, bytes_returned) = match io_control_code {
+        IOCTL_HELIOS_CTX_CREATE => {
+            // WdfRequestRetrieveInputBuffer/OutputBuffer -> HeliosCtxCreate
+            // adapter.with_virtio(|v| v.ctx_create(capset_id)) -> out_ctx_id
+            todo!()
+        }
+        IOCTL_HELIOS_CTX_DESTROY => {
+            // adapter.with_virtio(|v| v.ctx_destroy(ctx_id))
+            todo!()
+        }
+        IOCTL_HELIOS_SUBMIT_VENUS => {
+            // header from input buffer + Venus blob from WdfRequestRetrieveInputWdmMdl
+            // adapter.with_virtio(|v| v.submit_3d(ctx_id, fence_id, mdl_bytes))
+            todo!()
+        }
+        IOCTL_HELIOS_ALLOC_BLOB => {
+            // adapter.with_virtio(|v| v.alloc_blob(..)) -> out_resource_id
+            todo!()
+        }
+        IOCTL_HELIOS_MAP_BLOB => {
+            // adapter.with_virtio(|v| v.map_blob(resource_id)) -> out_user_va
+            todo!()
+        }
+        IOCTL_HELIOS_WAIT_FENCE => {
+            // KeWaitForSingleObject on the fence_id -> KEVENT (timeout_ns)
+            todo!()
+        }
+        _ => (STATUS_INVALID_DEVICE_REQUEST, 0usize),
     };
 
-    // Submit to virtqueue:
-    // [descriptor 0] = VirtioGpuCmdSubmit header (device-readable)
-    // [descriptor 1] = DMA buffer content (device-readable)
-    // [descriptor 2] = Response buffer (device-writable)
-    let status = virtio.submit_3d_cmd(&cmd, args.DmaBufferGpuVirtualAddress, args.DmaBufferSize);
-    if status != STATUS_SUCCESS { return status; }
-
-    STATUS_SUCCESS
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestCompleteWithInformation, request, status, bytes_returned as u64)
+    };
 }
 ```
+
+**SUBMIT_VENUS** maps to `VirtioGpu::submit_3d` (kmd/src/virtio/gpu.rs) over the virtio-drivers token API (`VirtQueue::{add_notify_wait_pop, add, pop_used}`). The KMD forwards opaque Venus bytes; encoding is the ICD's job.
+
+**Trust boundary (preserved):** every guest-supplied size/offset is validated against the WDF-reported in/out length before use; reads use `pod_read_unaligned`. See `protocol/src/escape.rs` for the op-struct layouts.
 
 ---
 
 ## Phase 3: Interrupt Handling
 
-> **ERRATA (2026-06-04): use the virtio-drivers token API, not the hand-rolled helpers below.** ISR (`dxgkddi_interrupt_routine`, DIRQL — no alloc/pageable): `transport.ack_interrupt()` + `DxgkCbQueueDpc` + return BOOLEAN. DPC (`dxgkddi_dpc_routine`, DISPATCH): under the control-queue spinlock, `VirtQueue::pop_used(token)` → map token→fence_id → set the per-fence KEVENT (interim fence model). `read_isr` / `poll_used(&mut [u16])` / `free_chain` / `get_fence_for_descriptor` **do not exist**. The monitored-fence path (`DxgkCbNotifyInterrupt`) stays deferred.
+The KMDF interrupt object is created with `WdfInterruptCreate` (during prepare-hardware or device-add), naming an ISR and a DPC.
 
 ```rust
-// src/ddi/interrupt.rs
+// src/interrupt.rs
 
-/// ISR — runs at DIRQL. Must be fast. No allocations.
-pub unsafe extern "C" fn dxgkddi_interrupt_routine(
-    miniport_device_context: *mut core::ffi::c_void,
-    message_number: u32,
-) -> bool {
-    let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
-    let virtio = match adapter.virtio.as_mut() { Some(v) => v, None => return false };
+/// EvtInterruptIsr — runs at DIRQL. Must be fast. No allocations, no pageable code.
+pub unsafe extern "C" fn evt_interrupt_isr(
+    interrupt: WDFINTERRUPT,
+    _message_id: u32,
+) -> BOOLEAN {
+    let device = unsafe {
+        call_unsafe_wdf_function_binding!(WdfInterruptGetDevice, interrupt)
+    };
+    let adapter = unsafe { &*crate::pnp::adapter_context(device) };
 
-    // Read ISR status register — this also clears the interrupt on legacy virtio
-    let isr = virtio.read_isr();
-    if isr == 0 { return false; } // not our interrupt
+    // Acknowledge the interrupt at the device (also tells us if it was ours).
+    let ours = adapter.with_virtio(|v| v.transport_ack_interrupt()).unwrap_or(false);
+    if !ours { return 0; } // not our interrupt
 
-    // Check used ring for fence completions
-    let mut completed = [0u16; 32];
-    let n = virtio.ctrl_queue.poll_used(&mut completed);
+    // Defer used-ring processing to the DPC.
+    unsafe { call_unsafe_wdf_function_binding!(WdfInterruptQueueDpcForIsr, interrupt) };
+    1
+}
 
-    for &head in &completed[..n] {
-        // Each completed descriptor corresponds to one CMD_SUBMIT_3D.
-        // Extract fence ID from the response buffer.
-        let fence_id = virtio.get_fence_for_descriptor(head);
-        if let Some(fid) = fence_id {
-            // Notify Dxgkrnl of fence completion.
-            // DxgkCbNotifyInterrupt must be called at DIRQL from the ISR.
-            let mut interrupt = DXGKARGCB_NOTIFY_INTERRUPT_DATA::default();
-            interrupt.Flags.ValidMonitoredFenceValue = 1;
-            interrupt.MonitoredFenceData.NodeOrdinal     = 0;
-            interrupt.MonitoredFenceData.EngineOrdinal   = 0;
-            interrupt.MonitoredFenceData.FenceValueCPUVirtualAddress = core::ptr::null_mut(); // STUB
-            interrupt.MonitoredFenceData.CurrentFenceValue = fid;
+/// EvtInterruptDpc — runs at DISPATCH_LEVEL after the ISR.
+pub unsafe extern "C" fn evt_interrupt_dpc(
+    interrupt: WDFINTERRUPT,
+    _associated_object: WDFOBJECT,
+) {
+    let device = unsafe {
+        call_unsafe_wdf_function_binding!(WdfInterruptGetDevice, interrupt)
+    };
+    let adapter = unsafe { &*crate::pnp::adapter_context(device) };
 
-            unsafe {
-                (adapter.dxgkrnl.as_ref().unwrap().DxgkCbNotifyInterrupt)(
-                    adapter.dxgkrnl.as_ref().unwrap().DeviceHandle,
-                    &interrupt,
-                );
+    // Pop completed tokens from the used ring under the queue lock, map each
+    // token -> fence_id, and signal the per-fence KEVENT so a pending
+    // WAIT_FENCE wakes. Interim fence model: fence_id <-> KEVENT table.
+    let _ = adapter.with_virtio(|v| {
+        while let Some(token) = v.pop_used() {
+            if let Some(fid) = v.fence_for_token(token) {
+                // KeSetEvent on adapter.fences[fid]
+                let _ = fid;
             }
         }
-        virtio.ctrl_queue.free_chain(head);
-    }
-
-    // Schedule DPC to call DxgkCbQueueDpc
-    // SAFETY: DxgkCbNotifyInterrupt was just called above.
-    unsafe {
-        (adapter.dxgkrnl.as_ref().unwrap().DxgkCbQueueDpc)(
-            adapter.dxgkrnl.as_ref().unwrap().DeviceHandle,
-        );
-    }
-
-    true
-}
-
-/// DPC routine — runs at DISPATCH_LEVEL after ISR
-pub unsafe extern "C" fn dxgkddi_dpc_routine(
-    miniport_device_context: *mut core::ffi::c_void,
-) {
-    // Dxgkrnl calls this after we queued a DPC via DxgkCbQueueDpc.
-    // We don't need to do anything here — Dxgkrnl handles the fence signaling
-    // after we called DxgkCbNotifyInterrupt in the ISR.
-    let _ = miniport_device_context;
+    });
 }
 ```
+
+All `DxgkCbNotifyInterrupt` / `DxgkCbQueueDpc` / `DXGKARGCB_*` monitored-fence callbacks are deleted — there is no Dxgkrnl, and fences are signalled through the KMD's own `fence_id -> KEVENT` table.
 
 ---
 
 ## Phase 3: INF File
 
-The INF tells Windows how to install the driver and which hardware ID to match.
+The INF tells Windows how to install the driver and which hardware ID to match. As a System-class KMDF driver it carries a `[.Wdf]` KMDF directive and **no** display SoftwareSettings, **no** `LoadOrderGroup=Video`, and **no** CoInstallers (inbox KMDF on Win10 1709+ / the 16299 floor; the legacy `CoInstallers32` pattern is forbidden in a universal INF).
 
 ```ini
 ; helios_kmd.inx
@@ -894,14 +770,15 @@ The INF tells Windows how to install the driver and which hardware ID to match.
 
 [Version]
 Signature   = "$Windows NT$"
-Class       = Display
-ClassGUID   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Class       = System
+ClassGUID   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %ProviderName%
 DriverVer   = ; auto-stamped
 CatalogFile = helios_kmd.cat
+PnpLockdown = 1
 
 [DestinationDirs]
-DefaultDestDir = 12  ; %WinDir%\System32\Drivers
+DefaultDestDir = 13  ; driver store (universal INF)
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
@@ -919,40 +796,38 @@ helios_kmd.sys = 1,,
 
 ; ──── Installation ─────────────────────────────────────────────────────────
 
-[Helios_Install]
+[Helios_Install.NT]
 CopyFiles = Helios_CopyFiles
 
-[Helios_Install.Services]
+[Helios_Install.NT.Services]
 AddService = helios_kmd, 0x00000002, Helios_ServiceInstall
 
 [Helios_ServiceInstall]
 ServiceType   = 1                   ; SERVICE_KERNEL_DRIVER
 StartType     = 3                   ; SERVICE_DEMAND_START
-ErrorControl  = 0                   ; SERVICE_ERROR_IGNORE
-ServiceBinary = %12%\helios_kmd.sys
-LoadOrderGroup = Video
+ErrorControl  = 1                   ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\helios_kmd.sys
+
+; ──── KMDF directive ───────────────────────────────────────────────────────
+
+[Helios_Install.NT.Wdf]
+KmdfService = helios_kmd, helios_wdfsect
+
+[helios_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$   ; resolves to 1.33
 
 [Helios_CopyFiles]
 helios_kmd.sys
-
-; ──── Software key ─────────────────────────────────────────────────────────
-
-[Helios_Install.SoftwareSettings]
-AddReg = Helios_SoftwareSettings_Reg
-
-[Helios_SoftwareSettings_Reg]
-HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, "helios_icd"
-HKR,, Version,                 %REG_DWORD%,    1
 
 ; ──── Strings ──────────────────────────────────────────────────────────────
 
 [Strings]
 ProviderName = "Helios Project"
-DeviceDesc   = "Helios vGPU Render Adapter"
+DeviceDesc   = "Helios vGPU"
 DiskName     = "Helios vGPU Driver Disk"
-REG_DWORD    = 0x00010001
-REG_MULTI_SZ = 0x00010000
 ```
+
+The device interface (`GUID_DEVINTERFACE_HELIOS`) is registered in code via `WdfDeviceCreateDeviceInterface`, so the INF needs nothing extra for it. The Vulkan ICD's Khronos registry JSON is written by the ICD installer, independent of this INF.
 
 ---
 
@@ -962,7 +837,7 @@ REG_MULTI_SZ = 0x00010000
 Paging in a non-paged function. Mark all ISR code as `#[link_section = ".text"]` (non-pageable), and anything called from DISPATCH_LEVEL.
 
 ### BSOD: SYSTEM_SERVICE_EXCEPTION in helios_kmd
-Almost always a bad pointer dereference. Check that `miniport_device_context` is your `AdapterContext`, not something shifted. Add `DbgBreakPoint()` assertions in debug builds.
+Almost always a bad pointer dereference. Check that the KMDF device context retrieved via `WdfObjectGetTypedContext` is your `AdapterContext`, not something shifted. Add `DbgBreakPoint()` assertions in debug builds.
 
 ### Device shows as "Unknown Device" in Device Manager
 The INF hardware ID doesn't match the actual PCI ID. Verify:
@@ -970,8 +845,8 @@ The INF hardware ID doesn't match the actual PCI ID. Verify:
 Get-PnpDevice | Where-Object { $_.HardwareID -like "*1AF4*" }
 ```
 
-### `DxgkInitialize` returns `STATUS_INVALID_PARAMETER`
-The `DRIVER_INITIALIZATION_DATA` version doesn't match the DDIs you've filled in. Start with the lowest WDDM version and work up.
+### `WdfDriverCreate` fails / device interface not enumerated
+If `WdfDriverCreate` returns an error, the `[.Wdf]` KMDF directive or `KmdfLibraryVersion` in the INF is wrong (must resolve to 1.33) — confirm the `[helios_wdfsect]` section is present and referenced from `[Helios_Install.NT.Wdf]`. If the driver loads but the Vulkan loader can't find the device, check both that the device interface is registered (`WdfDeviceCreateDeviceInterface(GUID_DEVINTERFACE_HELIOS)` succeeded and the device reached D0) **and** that the Khronos JSON value exists under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` pointing at the ICD DLL.
 
 ### Virtqueue stuck / no responses
 1. Check that you're posting descriptors in the right order (readable before writable)

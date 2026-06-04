@@ -1,7 +1,7 @@
 //! virtio-gpu PCI transport (KMD-local).
 //!
 //! A hand-rolled virtio-modern-PCI + split-virtqueue driver that brings the
-//! virtio-gpu device online from `DxgkDdiStartDevice` (Phase 2). The on-wire
+//! virtio-gpu device online from `evt_device_prepare_hardware`. The on-wire
 //! virtio-gpu command/response structs and the feature/status/cap constants live
 //! in the shared `helios_protocol` crate (single source of truth shared with the
 //! ICD); this module owns only the guest-internal transport — PCI capability
@@ -17,6 +17,7 @@ pub mod config;
 pub mod gpu;
 pub mod hal;
 
+pub use config::KmdfConfigAccess;
 pub use gpu::VirtioGpu;
 
 use wdk_sys::{

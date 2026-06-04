@@ -1,86 +1,75 @@
-//! TEMPORARY post-start bring-up tracer (remove once Code 43 / AddAdapter clears).
+//! Boot-time breadcrumb for headless diagnosis (no kernel debugger / DebugView).
 //!
-//! dxgkrnl's StartAdapter→AddAdapter sequence drives a series of our DDIs and can
-//! fail internally (e.g. `STATUS_OBJECT_NAME_NOT_FOUND`) with no NTSTATUS we get
-//! to see. To find which DDI dxgkrnl is calling (and which we answer how) right
-//! before it gives up, each instrumented PASSIVE-level DDI calls [`record`],
-//! which appends a `REG_DWORD` breadcrumb as values `S0`, `S1`, `S2`, … under
-//! `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd`. After a repro read them in
-//! order (`reg query` / `Get-ItemProperty`); the last few before the failure
-//! point at the culprit.
-//!
-//! IRQL: `RtlWriteRegistryValue` requires PASSIVE_LEVEL — only call [`record`]
-//! from PASSIVE DDIs (never the DPC/ISR or DISPATCH paging paths).
-//!
-//! Breadcrumb code encoding (high byte = which DDI, low bytes = detail):
-//!   0x01_00_0000 | type     QueryAdapterInfo entry (DXGK_QUERYADAPTERINFOTYPE)
-//!   0x02_00_0000 | type     QueryAdapterInfo answered STATUS_NOT_SUPPORTED (type)
-//!   0x03_00_0000 | ordinal  GetNodeMetadata entry
-//!   0x04_00_0000            QueryInterface entry (followed by the GUID Data1)
-//!   0x05_00_0000            GetRootPageTableSize entry
-//!   0x06_00_0000            CreateProcess entry
-//!   raw value               an interface GUID Data1 logged after a 0x04 marker
+//! Each device-start milestone records a `stage` number and the last `NTSTATUS`
+//! into the device's hardware registry key (`PLUGPLAY_REGKEY_DEVICE` →
+//! `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...\Device Parameters`), readable from
+//! user mode. After a failed start, the highest stage written tells us exactly
+//! which callback the start reached. Best-effort: any registry error is ignored.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use wdk_sys::{
+    call_unsafe_wdf_function_binding, NTSTATUS, ULONG, UNICODE_STRING, WDFDEVICE, WDFKEY,
+    WDF_NO_OBJECT_ATTRIBUTES, NT_SUCCESS,
+};
 
-use wdk_sys::ntddk::RtlWriteRegistryValue;
+/// `PLUGPLAY_REGKEY_DEVICE` — the device's hardware key (Enum\...\Device
+/// Parameters), which always exists for an enumerated device.
+const PLUGPLAY_REGKEY_DEVICE: ULONG = 0x0000_0001;
+/// `KEY_WRITE` access mask.
+const KEY_WRITE: ULONG = 0x0002_0006;
 
-/// `RTL_REGISTRY_SERVICES` — Path is relative to
-/// `\Registry\Machine\System\CurrentControlSet\Services`.
-const RTL_REGISTRY_SERVICES: u32 = 1;
-/// `REG_DWORD`.
-const REG_DWORD: u32 = 4;
-/// Cap on breadcrumbs so a chatty steady state can't grow the key unbounded.
-const MAX_STEPS: u32 = 160;
+// Stage codes (the start path writes these in order).
+pub const STAGE_DEVICE_ADD_OK: u32 = 1;
+pub const STAGE_PREPARE_HW_ENTER: u32 = 2;
+pub const STAGE_BUS_INTERFACE_OK: u32 = 3;
+pub const STAGE_VIRTIO_INIT_FAILED: u32 = 4;
+pub const STAGE_PREPARE_HW_OK: u32 = 5;
+pub const STAGE_D0_ENTRY: u32 = 6;
 
-static STEP: AtomicU32 = AtomicU32::new(0);
-
-/// `"helios_kmd\0"` as UTF-16 — the service subkey under Services.
-static SERVICE_NAME: [u16; 11] = [
-    b'h' as u16, b'e' as u16, b'l' as u16, b'i' as u16, b'o' as u16, b's' as u16, b'_' as u16,
-    b'k' as u16, b'm' as u16, b'd' as u16, 0,
-];
-
-/// Append one DWORD breadcrumb. Cheap and lossy by design (best-effort tracing).
-pub fn record(mut code: u32) {
-    let idx = STEP.fetch_add(1, Ordering::Relaxed);
-    if idx >= MAX_STEPS {
-        return;
-    }
-    // Build the value name "S<idx>\0" as UTF-16 (idx < 160 → at most 3 digits).
-    let mut name = [0u16; 6];
-    name[0] = b'S' as u16;
-    let mut digits = [0u8; 3];
-    let mut n = idx;
-    let mut d = 0usize;
-    if n == 0 {
-        digits[0] = b'0';
-        d = 1;
-    } else {
-        while n > 0 {
-            digits[d] = b'0' + (n % 10) as u8;
-            n /= 10;
-            d += 1;
-        }
-    }
+/// Compile-time UTF-16 (ASCII subset) for registry value names.
+const fn utf16<const N: usize>(b: &[u8; N]) -> [u16; N] {
+    let mut out = [0u16; N];
     let mut i = 0;
-    while i < d {
-        name[1 + i] = digits[d - 1 - i] as u16;
+    while i < N {
+        out[i] = b[i] as u16;
         i += 1;
     }
-    name[1 + d] = 0;
+    out
+}
 
-    // SAFETY: PASSIVE_LEVEL (see module note). Path/ValueName are NUL-terminated
-    // UTF-16; ValueData points to a 4-byte DWORD. RtlWriteRegistryValue copies the
-    // value, so `code`'s lifetime ending after the call is fine.
-    unsafe {
-        RtlWriteRegistryValue(
-            RTL_REGISTRY_SERVICES,
-            SERVICE_NAME.as_ptr(),
-            name.as_ptr(),
-            REG_DWORD,
-            (&mut code as *mut u32).cast::<core::ffi::c_void>(),
-            4,
-        );
+static STAGE_NAME: [u16; 12] = utf16(b"HeliosStage\0");
+static STATUS_NAME: [u16; 13] = utf16(b"HeliosStatus\0");
+
+/// Build a `UNICODE_STRING` over a NUL-terminated static UTF-16 array (Length
+/// excludes the NUL; MaximumLength includes it).
+fn unicode(s: &'static [u16]) -> UNICODE_STRING {
+    UNICODE_STRING {
+        Length: ((s.len() - 1) * 2) as u16,
+        MaximumLength: (s.len() * 2) as u16,
+        Buffer: s.as_ptr() as *mut u16,
     }
+}
+
+/// Record `(stage, status)` into the device's hardware registry key.
+///
+/// # Safety
+/// `device` must be a valid WDFDEVICE. Best-effort; runs at PASSIVE_LEVEL (the
+/// PnP/power callbacks that call it are all PASSIVE).
+pub unsafe fn record(device: WDFDEVICE, stage: u32, status: NTSTATUS) {
+    let mut key: WDFKEY = core::ptr::null_mut();
+    let st = call_unsafe_wdf_function_binding!(
+        WdfDeviceOpenRegistryKey,
+        device,
+        PLUGPLAY_REGKEY_DEVICE,
+        KEY_WRITE,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &mut key
+    );
+    if !NT_SUCCESS(st) {
+        return;
+    }
+    let sname = unicode(&STAGE_NAME);
+    let _ = call_unsafe_wdf_function_binding!(WdfRegistryAssignULong, key, &sname, stage);
+    let stname = unicode(&STATUS_NAME);
+    let _ = call_unsafe_wdf_function_binding!(WdfRegistryAssignULong, key, &stname, status as ULONG);
+    call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
 }

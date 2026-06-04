@@ -3,15 +3,21 @@
 //! `VirtioGpu` owns the `PciTransport` (discovers/maps the virtio config
 //! regions), the control `VirtQueue`, and a contiguous DMA scratch page, and
 //! layers the virtio-gpu command protocol (`helios_protocol`) on top. Built by
-//! `init` from `DxgkDdiStartDevice` and stored in `AdapterContext::virtio`.
+//! `init` from `evt_device_prepare_hardware` and stored in
+//! `AdapterContext::virtio`.
 //!
 //! Bring-up (all in `init`, at PASSIVE_LEVEL):
-//!   M1 — `DxgkConfigAccess` → `PciRoot` → `PciTransport::new::<WdkHal,_>`
+//!   M1 — `KmdfConfigAccess` (over BUS_INTERFACE_STANDARD) → `PciRoot` →
+//!        `PciTransport::new::<WdkHal,_>`
 //!   M2 — feature negotiation via the `Transport` trait
 //!   M3 — control `VirtQueue::<WdkHal>` setup + DRIVER_OK
 //!   M4 — `GET_DISPLAY_INFO` polled round-trip (Phase-2 smoke test)
+//!
+//! PHASE 4 TODO: scan for `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`
+//! (shmid == HOST_VISIBLE) here to record the host-visible BAR base for
+//! `MAP_BLOB` (ARCH.md §6), and add `alloc_blob`/`map_blob`/`pop_used` for the
+//! blob + async-fence paths. Not needed for the Phase 1–3 control path.
 
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::Zeroable;
@@ -25,12 +31,10 @@ use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
-use virtio_drivers::{BufferDirection, Hal};
 
-use super::config::DxgkConfigAccess;
-use super::hal::WdkHal;
+use super::config::KmdfConfigAccess;
+use super::hal::{DmaBuffer, WdkHal};
 use super::VirtioError;
-use crate::dxgk::DXGKRNL_INTERFACE;
 
 /// Control queue index (virtio-gpu controlq = 0; cursorq = 1 is unused).
 const CTRL_QUEUE: u16 = 0;
@@ -45,9 +49,9 @@ pub struct VirtioGpu {
     transport: PciTransport,
     /// Control virtqueue (queue 0) — all GPU commands ride this.
     control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
-    /// Contiguous DMA scratch page for synchronous command buffers. Freed in
-    /// teardown (M6).
-    scratch: NonNull<u8>,
+    /// Contiguous DMA scratch page for synchronous command buffers. RAII —
+    /// `DmaBuffer::drop` frees the page (including on `init`'s early-error paths).
+    scratch: DmaBuffer,
     /// Next virtio-gpu 3D context id to hand out (guest-assigned; 0 is the
     /// reserved global context, so we start at 1). Phase 3.
     next_ctx_id: AtomicU32,
@@ -57,13 +61,14 @@ pub struct VirtioGpu {
 
 impl VirtioGpu {
     /// Bring the virtio-gpu device online and prove it with `GET_DISPLAY_INFO`.
-    pub fn init(dxgkrnl: &DXGKRNL_INTERFACE) -> Result<Self, VirtioError> {
-        // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
-        // A miniport doesn't own the bus, so config space is reached via the
-        // Dxgkrnl callbacks; the DeviceFunction is a formality (DxgkConfigAccess
-        // ignores it and addresses our own device via the DeviceHandle).
-        let access = DxgkConfigAccess::new(dxgkrnl);
-        let mut root = PciRoot::new(access);
+    pub fn init(access: &KmdfConfigAccess) -> Result<Self, VirtioError> {
+        // ── M1: discover the device + map BARs through the bus interface ────
+        // A function driver doesn't own the bus, so config space is reached via
+        // the PCI bus's BUS_INTERFACE_STANDARD (GetBusData/SetBusData); the
+        // DeviceFunction is a formality (KmdfConfigAccess ignores it and
+        // addresses our own device via the bus-interface context). BAR MMIO is
+        // mapped on demand by WdkHal inside PciTransport::new.
+        let mut root = PciRoot::new(*access);
         let device_function = DeviceFunction {
             bus: 0,
             device: 0,
@@ -102,6 +107,16 @@ impl VirtioGpu {
             /* event_idx */ false,
         )
         .map_err(|_| VirtioError::DeviceError)?;
+
+        // Suppress device used-ring interrupts (VIRTQ_AVAIL_F_NO_INTERRUPT). The
+        // Phase 1–3 control path is purely synchronous — every command rides
+        // `add_notify_wait_pop`, which POLLS the used ring; nothing reads the
+        // virtio ISR-status register. Leaving interrupts enabled would assert a
+        // level-triggered INTx line (virtio-drivers does not program MSI-X) that
+        // our ISR never acks → an interrupt storm. Phase 4 re-enables this
+        // (set_dev_notify(true)) when the DPC becomes the used-ring consumer.
+        control.set_dev_notify(false);
+
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -113,16 +128,10 @@ impl VirtioGpu {
         // Request + response live in one contiguous page so each buffer is
         // physically contiguous for the device (our Hal::share is identity — no
         // bounce buffer). Halves are disjoint (split_at_mut): request is read by
-        // the device, response is written by it.
-        let (scratch_pa, scratch) = WdkHal::dma_alloc(1, BufferDirection::Both);
-        if scratch_pa == 0 {
-            // dma_alloc signals failure with a zero physaddr + dangling ptr;
-            // bail rather than write into the dangling page.
-            return Err(VirtioError::OutOfMemory);
-        }
-        // SAFETY: `scratch` is a freshly-allocated, owned, contiguous page.
-        let buf = unsafe { core::slice::from_raw_parts_mut(scratch.as_ptr(), SCRATCH_BYTES) };
-        let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
+        // the device, response is written by it. `scratch` is RAII: any `?`
+        // early-return below frees the page via DmaBuffer::drop.
+        let mut scratch = DmaBuffer::new(SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
+        let (req_buf, resp_buf) = scratch.as_mut_slice().split_at_mut(SCRATCH_BYTES / 2);
 
         let hdr_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
         let resp_len = core::mem::size_of::<VirtioGpuRespDisplayInfo>();
@@ -216,8 +225,12 @@ impl VirtioGpu {
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
         // SAFETY: `scratch` is our owned contiguous page; the low half holds the
         // submit header (device-read), the high half the response (device-write).
-        // Disjoint halves; serialized by the caller's spinlock.
-        let buf = unsafe { core::slice::from_raw_parts_mut(self.scratch.as_ptr(), SCRATCH_BYTES) };
+        // Disjoint halves; serialized by the caller's spinlock. We take a raw
+        // pointer (not a &mut borrow of self.scratch) so self.control/transport
+        // can be borrowed for the round-trip below.
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(self.scratch.as_slice().as_ptr() as *mut u8, SCRATCH_BYTES)
+        };
         let (hdr_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
         hdr_buf[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 
@@ -244,8 +257,11 @@ impl VirtioGpu {
     fn ctrl_roundtrip(&mut self, req: &[u8]) -> Result<(), VirtioError> {
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
         // SAFETY: owned contiguous page; disjoint req/resp halves, serialized by
-        // the caller's spinlock.
-        let buf = unsafe { core::slice::from_raw_parts_mut(self.scratch.as_ptr(), SCRATCH_BYTES) };
+        // the caller's spinlock. Raw pointer (not a &mut borrow of self.scratch)
+        // so self.control/transport can be borrowed for the round-trip.
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(self.scratch.as_slice().as_ptr() as *mut u8, SCRATCH_BYTES)
+        };
         let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
         if req.len() > req_buf.len() || resp_len > resp_buf.len() {
             return Err(VirtioError::DeviceError);
@@ -272,17 +288,14 @@ impl Drop for VirtioGpu {
         // Quiesce the device (resets queues) so it stops touching the rings we
         // are about to free.
         self.transport.set_status(DeviceStatus::empty());
-        // Free the DMA scratch page. The control `VirtQueue` frees its own ring
-        // memory on its own drop (via `Hal::dma_dealloc`).
+        // The `scratch` DmaBuffer frees its contiguous page on its own drop, and
+        // the control `VirtQueue` frees its ring memory on its drop (via
+        // `Hal::dma_dealloc`).
         //
         // The BAR MMIO mappings made inside `PciTransport` are intentionally NOT
         // freed here: `WdkHal` caches them by physical address and reuses them on
-        // the next StartDevice (the BARs are stable across stop/start), so there
-        // is no per-cycle leak. The cache is released wholesale in
-        // `DxgkDdiUnload` via `WdkHal::unmap_all`.
-        //
-        // SAFETY: `scratch` was returned by `WdkHal::dma_alloc(1, ..)` in `init`
-        // and is freed exactly once (here, when the VirtioGpu is dropped).
-        unsafe { WdkHal::dma_dealloc(0, self.scratch, 1) };
+        // the next PrepareHardware (the BARs are stable across stop/start), so
+        // there is no per-cycle leak. The cache is released wholesale in
+        // `EvtDriverUnload` via `WdkHal::unmap_all`.
     }
 }

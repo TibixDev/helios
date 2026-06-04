@@ -1,12 +1,12 @@
 # CLAUDE.md — Opus 4.6 Primary Implementor Instructions
 
-## Project: KVM Windows Render-Only GPU Driver (Helios vGPU)
+## Project: System-class KMDF virtio-gpu / Venus passthrough driver (Helios vGPU)
 
 You are the **primary author** of this project. The human overseer has OS/driver/Rust expertise and will review your work, but you must drive all implementation decisions, write all code, and flag blockers proactively.
 
-**Implementation reality (learned — authoritative over older prose in these docs):** The KMD is a **WDDM render-only graphics** miniport (NOT MCDM/ComputeAccelerator), declared at the **OS-native `DXGKDDI_INTERFACE_VERSION`** (WDDM 3.2 on the 24H2/26100 WDK — an earlier WDDM-2.0 pin was reverted because 24H2 rejects a 2.0 adapter's user-mode driver). `wdk-sys` exposes no display DDIs, so `kmd/build.rs` custom-bindgens `dispmprt.h` + `d3dkmddi.h` into a `crate::dxgk` module and links `displib.lib` (for `DxgkInitialize`). Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See OVERVIEW.md "Driver Model & WDDM Targeting" and the errata banners in KMD.md / TOOLCHAIN.md.
+**Implementation reality (learned — authoritative over older prose in these docs):** The KMD is a **System-class KMDF function driver** for the virtio-gpu PCI device (PCI\VEN_1AF4&DEV_1050), Setup class **System {4d36e97d-e325-11ce-bfc1-08002be10318}** — NOT a display/WDDM miniport. User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID_DEVINTERFACE_HELIOS`, discovered with SetupDiGetClassDevs + CreateFile). `kmd/build.rs` uses only `wdk-sys`/WDF — collapse it to `Config::from_env_auto()?.configure_binary_build()?`; the `dispmprt.h`/`d3dkmddi.h` custom bindgen (the `crate::dxgk` module) and the `displib.lib`/`DxgkInitialize` link are **deleted**. Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See ARCH.md (canonical) and the errata banners in KMD.md / TOOLCHAIN.md.
 
-**Phase 3 status (2026-06-04 — detail in the `addadapter-umd-blocker`, `venus-host-blocker`, `mesa-venus-icd-port` memories):** Phases 1–2 done (driver loads, virtio-gpu transport up, GET_DISPLAY_INFO round-trips). The venus host stack now works (libvirt `seccomp_sandbox=0`; `virtio-gpu-gl,venus=on,blob=on,hostmem=4G`; egl-headless on the Intel iGPU / Mesa ANV; `honor-guest-pat=on`), so `DxgkDdiStartDevice` passes virtio feature negotiation. The Phase-3 KMD spine (M3.1–M3.3: lock-guarded `AdapterContext` with `with_virtio`/`set_virtio`; `ctx_create`/`ctx_destroy`/`submit_venus`; full `DxgkDdiEscape` dispatch) is written and compiles but is **not yet runtime-verified** — the device is still at **Code 43**: a WDDM *render* adapter must register a version-matched user-mode driver (`UserModeDriverName`). A pure-Rust **stub D3D UMD** (`umd/`) clears the `OBJECT_NAME_NOT_FOUND`, but the runtime still `REVISION_MISMATCH`es it (the UMD version handshake is the current blocker; next step is to log the runtime's requested `Interface`/`Version` from `OpenAdapter10_2`). The **Mesa-venus Vulkan-ICD port is the Phase-5 plan, DEFERRED** until the adapter is healthy; the stub D3D UMD is the interim. NOTE: `kmd/src/diag.rs` is a TEMPORARY registry-breadcrumb tracer — remove once Code 43 clears.
+**Status (2026-06-04 — detail in the `systemclass-pivot`, `venus-host-blocker`, `mesa-venus-icd-port` memories):** The venus host stack works (libvirt `seccomp_sandbox=0`; `virtio-gpu-gl,venus=on,blob=on,hostmem=4G`; egl-headless on the Intel iGPU / Mesa ANV; `honor-guest-pat=on`), so virtio feature negotiation succeeds. **Helios has pivoted OFF the WDDM render-miniport model to a System-class KMDF + DeviceIoControl + Venus architecture (the mvisor model).** The six `helios_protocol` ops (CTX_CREATE, CTX_DESTROY, SUBMIT_VENUS, ALLOC_BLOB, MAP_BLOB, WAIT_FENCE) keep their exact wire layout and move from a kernel-escape carrier onto IOCTL input/output buffers; the virtio-gpu transport, the `helios_protocol` wire crate, and the Venus host stack are reused unchanged. **ARCH.md is the canonical source of truth — read it first**; the `systemclass-pivot` memory is the authoritative start point.
 
 ---
 
@@ -25,13 +25,13 @@ Set this via the **`CARGO_TARGET_DIR` environment variable** on each cargo/`carg
 
 ## Your Role & Operating Rules
 
-1. **Always read the relevant spec doc before writing any code** in that subsystem. The docs are the ground truth; do not guess at WDDM DDI signatures or Venus protocol fields.
+1. **Always read the relevant spec doc before writing any code** in that subsystem. The docs are the ground truth; do not guess at WDF/IOCTL signatures or Venus protocol fields.
 2. **Never stub silently.** If a function is a stub, mark it `// STUB: reason` and log a `todo!()` or return a documented error code.
 3. **Prefer explicit over clever.** Kernel code has zero tolerance for bugs. Prefer verbose, obviously correct code over clever abstractions.
 4. **All unsafe blocks must have a `// SAFETY:` comment** explaining the invariant being upheld.
 5. **One DDI function per commit message topic.** Keep changes scoped.
 6. **Test at every milestone** using the test plan in each doc before proceeding.
-7. When you encounter a WDDM DDI you haven't implemented yet, return `STATUS_NOT_IMPLEMENTED` (not a panic or crash).
+7. When you encounter an IOCTL control code you don't recognize, return `STATUS_INVALID_DEVICE_REQUEST` (not a panic or crash).
 
 ---
 
@@ -40,41 +40,31 @@ Set this via the **`CARGO_TARGET_DIR` environment variable** on each cargo/`carg
 ```
 helios-vgpu/
 ├── CLAUDE.md              ← You are here
-├── OVERVIEW.md            ← Architecture (read first)
+├── ARCH.md                ← Canonical architecture (System-class KMDF + IOCTL + Venus) — read first
+├── OVERVIEW.md            ← Architecture overview
 ├── KMD.md                 ← Kernel-mode driver guide
-├── ICD.md                 ← Vulkan ICD / UMD guide
+├── ICD.md                 ← Vulkan ICD guide
 ├── TRANSPORT.md           ← VirtIO + Venus wire protocol
 ├── HOST.md                ← Host-side setup guide
 ├── TOOLCHAIN.md           ← Build environment setup
 │
-├── kmd/                   ← Kernel-Mode Driver (Rust, WDM)
+├── kmd/                   ← Kernel-Mode Driver (Rust, KMDF/WDF)
 │   ├── Cargo.toml
 │   ├── build.rs
 │   ├── helios_kmd.inx
 │   └── src/
-│       ├── lib.rs         ← DriverEntry, DDI table
-│       ├── adapter.rs     ← Adapter init/teardown
-│       ├── device.rs      ← Per-device context
-│       ├── memory.rs      ← Segment/allocation management
-│       ├── scheduler.rs   ← DMA buffer submission
-│       ├── interrupt.rs   ← ISR/DPC handling
-│       ├── virtio/
-│       │   ├── mod.rs
-│       │   ├── pci.rs     ← PCI capability scanning
-│       │   ├── queue.rs   ← Virtqueue implementation
-│       │   └── gpu.rs     ← virtio-gpu command structs
-│       └── ddi/
+│       ├── lib.rs         ← DriverEntry, evt_device_add, IOCTL dispatch
+│       ├── adapter.rs     ← WDF device-object context (virtio + fence table)
+│       ├── ioctl.rs       ← EvtIoDeviceControl handlers (the IOCTL protocol)
+│       ├── pnp.rs         ← evt_device_add / prepare_hardware / release_hardware
+│       ├── interrupt.rs   ← WdfInterruptCreate + EvtInterruptIsr/EvtInterruptDpc
+│       └── virtio/
 │           ├── mod.rs
-│           ├── add_device.rs
-│           ├── start_device.rs
-│           ├── query_adapter_info.rs
-│           ├── create_allocation.rs
-│           ├── build_paging_buffer.rs
-│           ├── submit_command.rs
-│           ├── patch.rs
-│           └── interrupt.rs
+│           ├── pci.rs     ← PCI capability scanning
+│           ├── queue.rs   ← Virtqueue implementation
+│           └── gpu.rs     ← virtio-gpu command structs
 │
-├── icd/                   ← Vulkan ICD (Rust, user-mode DLL)
+├── icd/                   ← Vulkan ICD (Mesa venus port over IOCTL; supersedes the hand-written tree)
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs         ← vk_icdGetInstanceProcAddr entry
@@ -85,7 +75,7 @@ helios-vgpu/
 │   │   │   ├── encode.rs  ← Venus command serialization
 │   │   │   ├── decode.rs  ← Response deserialization
 │   │   │   └── ring.rs    ← Shared-memory command ring
-│   │   └── transport.rs   ← KMD escape calls (D3DKMTEscape)
+│   │   └── transport.rs   ← KMD calls via DeviceIoControl on GUID_DEVINTERFACE_HELIOS
 │   └── helios_vulkan.json ← ICD manifest
 │
 └── host/                  ← Host-side Rust daemon
@@ -101,64 +91,58 @@ helios-vgpu/
 ## Implementation Order (Follow This Exactly)
 
 ### Phase 0: Toolchain (TOOLCHAIN.md)
-- [ ] Set up Windows 11 dev VM with WDK 22H2, VS 2022, LLVM 17
-- [ ] Verify `cargo wdk build` works on the empty KMD skeleton
+- [ ] Set up Windows 11 dev VM with WDK (10.0.26100), VS 2022, LLVM 17
+- [ ] Flip the driver model to **KMDF** (driver-type `KMDF`, KMDF 1.33); verify `cargo make` / `win_cargo` builds the KMDF skeleton
 - [ ] Set up Linux host with QEMU 9.2+, virglrenderer (Venus-enabled)
 
-### Phase 1: KMD Skeleton — Adapter Enumeration
-Goal: Driver loads, finds the virtio-gpu PCI device, kernel does not crash.
+### Phase 1: KMDF Skeleton — Device Interface
+Goal: Driver loads, binds the virtio-gpu PCI FDO, exposes its device interface, kernel does not crash.
 
-- [ ] `DriverEntry` → fill `DRIVER_INITIALIZATION_DATA`, call `DxgkInitialize`
-- [ ] `DxgkDdiAddDevice` → allocate adapter context, return opaque handle
-- [ ] `DxgkDdiStartDevice` → save `DXGKRNL_INTERFACE`, enumerate PCI BARs, map MMIO
-- [ ] `DxgkDdiQueryAdapterInfo` → return `DXGK_DRIVERCAPS` with `RenderSupported=1`, zero display outputs
-- [ ] `DxgkDdiQueryChildRelations` → return empty (render-only, no children)
-- [ ] `DxgkDdiStopDevice` / `DxgkDdiRemoveDevice` → cleanup
+- [ ] `DriverEntry` → build `WDF_DRIVER_CONFIG { EvtDriverDeviceAdd: Some(evt_device_add), .. }`, call `WdfDriverCreate`
+- [ ] `evt_device_add` → set PnP/power callbacks, `WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(AdapterContext)`, `WdfDeviceCreate`, `WdfDeviceCreateDeviceInterface(&GUID_DEVINTERFACE_HELIOS)`, create the default parallel IO queue with `EvtIoDeviceControl`
+- [ ] `evt_device_prepare_hardware` → map BARs via the translated CM resource list (`MmMapIoSpaceEx`); obtain `BUS_INTERFACE_STANDARD` via `WdfFdoQueryForInterface`
+- [ ] `evt_device_release_hardware` → `set_virtio(None)`, `MmUnmapIoSpace` each BAR
+- [ ] `AdapterContext` lives in the WDF device-object context (`WdfObjectGetTypedContext`): `virtio_lock` + `with_virtio`/`set_virtio` + fence table
 
-**Test:** Device shows in Device Manager as "Helios vGPU Render Adapter". No BSOD.
+**Test:** Device shows in Device Manager under System devices; `GUID_DEVINTERFACE_HELIOS` opens via SetupDi/CreateFile. No BSOD.
 
-### Phase 2: VirtIO PCI + Virtqueue
+### Phase 2: VirtIO Transport under KMDF
 Goal: Can send `VIRTIO_GPU_CMD_GET_DISPLAY_INFO` and get a response.
 
-- [ ] Scan PCI capability list for VirtIO capability structures (type 4 = common cfg, type 5 = notify, type 2 = ISR, type 1 = device cfg)
-- [ ] Map all VirtIO BARs
-- [ ] Initialize virtqueues (control queue = 0, cursor queue = 1)
-- [ ] Implement virtqueue descriptor ring, available ring, used ring
+- [ ] Scan PCI capability list for VirtIO capability structures (type 4 = common cfg, type 5 = notify, type 2 = ISR, type 1 = device cfg, type 8 = shared-memory cfg)
+- [ ] Map all VirtIO BARs from the CM resource list
+- [ ] PCI config access via `KmdfConfigAccess` wrapping `BUS_INTERFACE_STANDARD` (`GetBusData`/`SetBusData`)
+- [ ] Initialize virtqueues (control queue = 0, cursor queue = 1) — descriptor/available/used rings
 - [ ] Implement `virtio_gpu_ctrl_hdr` and `VIRTIO_GPU_CMD_GET_DISPLAY_INFO`
-- [ ] Wire up MSI-X interrupt → `DxgkCbNotifyInterrupt` → `DxgkCbQueueDpc`
+- [ ] Wire up the interrupt: `WdfInterruptCreate` → `EvtInterruptIsr` (ack + `WdfInterruptQueueDpcForIsr`) → `EvtInterruptDpc` (pop used ring, signal per-fence KEVENT)
 
 **Test:** Send GET_DISPLAY_INFO from a test IOCTL, receive valid response in DebugView.
 
-### Phase 3: WDDM Memory Management
+### Phase 3: IOCTL Device Interface + Blob Management
+Goal: User mode can create a Venus context and allocate/map host-visible blobs over `DeviceIoControl`.
 
-> **NOTE (2026-06-04): Phases 3 & 4 are being executed together as ONE KMD push.** The Vulkan ICD's real kernel channel is the `DxgkDdiEscape` protocol (`helios_protocol::escape`), which sidesteps GPU VA — so the cheapest route to first host traffic is: clear **Code 43** with minimal GPU-VA DDI bodies (`GetRootPageTableSize` ≠ 0, `BuildPagingBuffer` always-SUCCESS, `CreateProcess` real) + implement `DxgkDdiEscape` (CTX_CREATE/SUBMIT_VENUS/WAIT_FENCE/...). `SubmitCommandVirtual`/`SubmitCommand` stay `STATUS_SUCCESS` no-ops (error → BugCheck 0x119). Venus byte *encoding* (`VN_CS_ENCODER`) is the icd/ crate's job (Phase 5); the KMD forwards opaque Venus bytes. **The `phase3-kickoff` memory is the authoritative start point** (the Phase 3/4 code sketches in KMD.md/TRANSPORT.md predate the virtio-drivers adoption and carry errata banners).
+- [ ] `evt_io_device_control` dispatch on the IOCTL control code (retrieve buffers via `WdfRequestRetrieveInputBuffer`/`OutputBuffer`; validate every guest-supplied size/offset against the WDF-reported in/out length)
+- [ ] `IOCTL_HELIOS_CTX_CREATE` → `VIRTIO_GPU_CMD_CTX_CREATE` with `VIRTIO_GPU_CAPSET_VENUS`; `IOCTL_HELIOS_CTX_DESTROY`
+- [ ] `IOCTL_HELIOS_ALLOC_BLOB` → allocate virtio-gpu blob resource IDs (returns `out_resource_id`)
+- [ ] `IOCTL_HELIOS_MAP_BLOB` → record the SHARED_MEMORY_CFG(HOST_VISIBLE) BAR base, build an MDL over the mapped pages, `MmMapLockedPagesSpecifyCache(UserMode)`, return `out_user_va`
 
-Goal: `CreateAllocation` / `DestroyAllocation` work, segments are set up.
+**Test:** A test EXE opens the device interface, creates a context, allocates a blob, and reads back a mapped user VA.
 
-- [ ] `DxgkDdiQueryAdapterInfo(DXGKQAITYPE_QUERYSEGMENT4)` — report one CPU-visible aperture segment backed by host memory (hostmem blob region)
-- [ ] `DxgkDdiCreateAllocation` — allocate virtio-gpu resource IDs
-- [ ] `DxgkDdiDestroyAllocation`
-- [ ] `DxgkDdiBuildPagingBuffer` — implement `DXGK_BUILDPAGINGBUFFER_OPERATION_TRANSFER` (map/unmap backing pages)
-- [ ] `DxgkDdiSubmitCommandVirtual` — queue DMA buffers (for WDDM 2.0 GPU VA model)
-
-**Test:** D3D12 device creation succeeds (via DXVK ICD stub).
-
-### Phase 4: Venus Context + Command Submission
+### Phase 4: Venus Submission + Fences
 Goal: First real Vulkan command reaches virglrenderer on the host.
 
-- [ ] Create Venus context via `VIRTIO_GPU_CMD_CTX_CREATE` with `VIRTIO_GPU_CAPSET_VENUS`
-- [ ] Implement command ring buffer (see TRANSPORT.md §4)
-- [ ] Implement `VN_CS_ENCODER` — Venus command serialization (start with `vkCreateInstance`)
-- [ ] `DxgkDdiEscape` handler for ICD → KMD: submit Venus command buffer, poll fence
+- [ ] `IOCTL_HELIOS_SUBMIT_VENUS` (METHOD_IN_DIRECT) → small buffered header (ctx_id/fence_id/buffer_size) + Venus blob via locked MDL (`WdfRequestRetrieveInputWdmMdl`); forward opaque Venus bytes to the host
+- [ ] `IOCTL_HELIOS_WAIT_FENCE` → block on the `fence_id → KEVENT` table (timeout_ns); `EvtInterruptDpc` signals the event when the used ring reports completion
+- [ ] Venus commands must be flushed before signaling the fence (ordering)
 
 **Test:** `vkCreateInstance` from a test EXE reaches the host and virglrenderer logs it.
 
 ### Phase 5: Vulkan ICD (icd/)
 Goal: `vulkaninfo` reports the Helios device.
 
-> **REVISED PLAN (2026-06-04, user-approved — see the `mesa-venus-icd-port` memory):** do NOT hand-write the Vulkan ICD / Venus encoder. **Port Mesa's `venus` driver (`vulkan-drivers=virtio`)** to Windows, swapping its Linux virtgpu-DRM `vn_renderer` backend for our `D3DKMTEscape` channel (`helios_protocol::escape`). This reuses Mesa's mature, byte-correct Venus encoder (virglrenderer's decoder is also Mesa → wire-compatible) and follows the mvisor-win-vgpu-driver porting pattern. The win11 Mesa build toolchain is already installed. This is **deferred** until the WDDM adapter is healthy (Code 43 cleared via the stub D3D UMD in `umd/`). A separate **stub D3D UMD** (not the Vulkan ICD) is what dxgkrnl needs to start the adapter.
+> **PLAN (2026-06-04, user-approved — see the `mesa-venus-icd-port` memory):** do NOT hand-write the Vulkan ICD / Venus encoder. **Port Mesa's `venus` driver (`-Dvulkan-drivers=virtio`)** to Windows, swapping its Linux virtgpu-DRM `vn_renderer` backend for an IOCTL backend over `DeviceIoControl` on `GUID_DEVINTERFACE_HELIOS` (modeled on the clean non-DRM `vn_renderer_vtest.c` template). This reuses Mesa's mature, byte-correct Venus encoder (virglrenderer's decoder is also Mesa → wire-compatible) and follows the mvisor-win-vgpu-driver porting pattern. The win11 Mesa build toolchain is already installed. The Windows Vulkan loader enumerates it purely through `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` registry JSON — precedent: SwiftShader and Mesa lavapipe enumerate via exactly this mechanism with no display adapter.
 
-- [ ] (Deferred) Port Mesa venus → Windows Vulkan ICD over D3DKMTEscape (see memory)
+- [ ] Port Mesa venus → Windows Vulkan ICD with an IOCTL `vn_renderer` backend (see memory)
 - [ ] Implement `vkEnumeratePhysicalDevices` → forward to host, deserialize capabilities
 - [ ] Implement `vkCreateDevice`, queues, command pools
 
@@ -179,19 +163,18 @@ Goal: D3D11/D3D12 apps render via DXVK → Helios ICD → Venus → host GPU.
 | Rule | Why |
 |------|-----|
 | Never call pageable code at IRQL > APC_LEVEL | BSOD `IRQL_NOT_LESS_OR_EQUAL` |
-| Never allocate in ISR (DxgkDdiInterruptRoutine) | ISR runs at DIRQL |
-| Always validate command buffer bounds in KMD | Security — guest can send malicious offsets |
+| Never allocate in ISR (EvtInterruptIsr) | ISR runs at DIRQL |
+| Always validate IOCTL input buffer bounds in KMD | Security — guest can send malicious offsets |
 | Virtqueue descriptors must not be freed while in-flight | Corruption |
 | Venus commands must be flushed before signaling fence | Ordering |
-| All WDDM 2.0+ drivers must use GPU VA, not physical addressing | Required by WDDM 2.0 |
 
 ---
 
 ## When You're Stuck
 
 1. Check `KMD.md` — there's a troubleshooting section per phase.
-2. Check the existing C reference: [kvm-guest-drivers-windows viogpu](https://github.com/virtio-win/kvm-guest-drivers-windows/tree/master/viogpu) — this is a display-only driver, but its virtio init code (`viogpu_queue.cpp`) is directly relevant.
-3. For WDDM DDI signatures: always use the WDK headers directly, not memory. The canonical reference is `d3dkmddi.h`, `dispmprt.h` accessed via `wdk-sys`.
+2. Check the C reference for the **virtio init** path only: [kvm-guest-drivers-windows viogpu](https://github.com/virtio-win/kvm-guest-drivers-windows/tree/master/viogpu) — its virtio init code (`viogpu_queue.cpp`) is directly relevant; ignore its display/WDDM surface.
+3. For the WDF/IOCTL surface: use the WDK headers via `wdk-sys` (`WdfRequestRetrieveInputBuffer`/`WdfRequestRetrieveInputWdmMdl`, `WdfDeviceCreateDeviceInterface`, `WdfInterruptCreate`) and `GUID_DEVINTERFACE_*` conventions. The [mvisor-win-vgpu-driver](https://github.com/Theelx/mvisor-win-vgpu-driver) is the reference for the System-class KMDF + IOCTL + Venus model.
 4. For Venus protocol: `venus-protocol/vk.xml` and `virglrenderer/src/venus/` are the ground truth.
 5. Ask the overseer if you hit a fundamental architecture issue.
 
@@ -199,7 +182,7 @@ Goal: D3D11/D3D12 apps render via DXVK → Helios ICD → Venus → host GPU.
 
 ## Files Not to Touch
 
-- `*.inx` files after initial creation — only modify with explicit instruction
+- `*.inx` files after initial creation — only modify with explicit instruction. **One-time exception:** `helios_kmd.inx` must be rewritten for the System-class KMDF pivot (Class=System / {4d36e97d-...}, `[.Wdf]` KmdfService directive, drop the display SoftwareSettings/UserModeDriverName/LoadOrderGroup=Video) per ARCH.md §9.
 
 ---
 
@@ -207,20 +190,19 @@ Goal: D3D11/D3D12 apps render via DXVK → Helios ICD → Venus → host GPU.
 
 ```rust
 // All kernel-mode code: no_std, no panics in release
-// Use wdk-sys types directly for DDI structs
-// Pattern for DDI implementations:
-pub unsafe extern "C" fn dxgkddi_foo(
-    miniport_context: *mut c_void,
-    args: *mut DXGKARG_FOO,
-) -> NTSTATUS {
-    // SAFETY: Dxgkrnl guarantees miniport_context is our adapter context
-    //         and args is a valid kernel-mode pointer.
-    let adapter = &mut *(miniport_context as *mut AdapterContext);
-    let args = &mut *args;
-    
-    match adapter.foo(args) {
-        Ok(()) => STATUS_SUCCESS,
-        Err(e) => e.into(),
-    }
+// Use wdk-sys types directly for WDF/IOCTL structs
+// Pattern for IOCTL handlers (dispatched from EvtIoDeviceControl):
+unsafe fn handle_foo(
+    adapter: &AdapterContext,
+    request: WDFREQUEST,
+) -> Result<usize, DriverError> {
+    // SAFETY: WDF guarantees `request` is a valid kernel-mode handle for the
+    //         lifetime of this callback; the input buffer length is validated
+    //         against size_of::<HeliosFoo>() before any read.
+    let in_buf = request_input_buffer::<HeliosFoo>(request)?;
+    let args = pod_read_unaligned::<HeliosFoo>(in_buf);
+
+    adapter.with_virtio(|v| v.foo(&args))?;
+    Ok(0) // bytes_returned for WdfRequestCompleteWithInformation
 }
 ```

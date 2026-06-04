@@ -9,6 +9,8 @@ The Linux host side of the Helios vGPU project consists of:
 
 You do NOT write a custom host-side daemon for the primary path — virglrenderer handles everything. The `host/` crate in this repo is for diagnostics and optional custom transport.
 
+The host stack is identical regardless of the guest driver model: the current System-class KMDF + DeviceIoControl guest uses the exact same venus/virglrenderer host setup described here as the earlier guest design did, so nothing in this document changes with the guest carrier.
+
 ---
 
 ## 1. Host Requirements Checklist
@@ -157,7 +159,7 @@ export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 
 ### 3.2 Checking Venus is Active
 
-After starting the VM and before the Windows driver loads, you can check using the vtest server to verify virglrenderer + Venus works:
+After starting the VM and before the Helios KMDF driver loads in the guest, you can check using the vtest server to verify virglrenderer + Venus works:
 
 ```bash
 # Stop QEMU, then test venus standalone:
@@ -240,7 +242,10 @@ Venus in virglrenderer runs in a separate process/thread per context. For best p
 
 ```bash
 export VIRGL_DEBUG=venus,vtest
-# Then in the VM, any Venus command will print to stderr on the host
+# Then in the VM, any Venus command will print to stderr on the host.
+# These traces are independent of how the guest carries the Venus stream
+# (the guest's transport carrier is invisible to the host) — only the
+# decoded Venus commands matter here.
 # Output example:
 # [venus] vkCreateInstance (ctx=1)
 # [venus] vkEnumeratePhysicalDevices (ctx=1) -> 1 device(s)

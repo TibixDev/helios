@@ -3,15 +3,18 @@ name = "helios_kmd"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
-description = "Helios vGPU kernel-mode WDDM 2.x render-only display miniport driver."
+description = "Helios vGPU System-class KMDF function driver for virtio-gpu (VEN_1AF4&DEV_1050); exposes GUID_DEVINTERFACE_HELIOS for the Venus IOCTL channel."
 
 [lib]
 crate-type = ["cdylib"]
 
-# windows-drivers-rs driver model. WDM = we register the DDI table ourselves
-# (via DxgkInitialize) rather than going through KMDF.
+# windows-drivers-rs driver model. KMDF function driver (System class) — we let
+# the WDF loader bind us to the PCI FDO; no WDM DDI table, no dxgkrnl.
+# KMDF 1.33 = WDK 10.0.26100 / Win11 24H2 (see ARCH.md §1).
 [package.metadata.wdk.driver-model]
-driver-type = "WDM"
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
 
 [dependencies]
 # windows-drivers-rs family — coherent set published 2025-11-14.
@@ -19,10 +22,12 @@ wdk = "0.4"
 wdk-sys = "0.5"
 wdk-alloc = "0.4"
 wdk-panic = "0.4"
-# Shared wire-format definitions (no_std), so virtio-gpu structs match the ICD.
+# Shared wire-format definitions (no_std), so virtio-gpu structs + the IOCTL
+# protocol match the ICD byte-for-byte.
 helios_protocol = { path = "../protocol" }
-# no_std; used to serialize helios_protocol command structs (Pod) into the DMA
-# scratch buffers. default-features=false keeps it std-free for the kernel target.
+# no_std; used to (de)serialize helios_protocol command structs (Pod) into the
+# DMA scratch buffers and IOCTL buffers. default-features=false keeps it
+# std-free for the kernel target.
 bytemuck = { version = "1", default-features = false, features = ["derive"] }
 # Maintained no_std virtio transport. We implement its Hal + ConfigurationAccess
 # over WDK primitives (see virtio/hal.rs, virtio/config.rs) and drive a raw
@@ -30,12 +35,10 @@ bytemuck = { version = "1", default-features = false, features = ["derive"] }
 virtio-drivers = "0.13"
 
 [build-dependencies]
+# Configures downstream linking against the WDK (resolves ntoskrnl, WdfLdr, the
+# KMDF stub import lib, etc.). No custom bindgen — all WDF/NT bindings come from
+# wdk-sys, and WDF functions are called through call_unsafe_wdf_function_binding!.
 wdk-build = "0.5"
-# We generate the WDDM display-miniport DDIs ourselves: wdk-sys has no display
-# ApiSubset, so build.rs runs bindgen over dispmprt.h + d3dkmddi.h. See build.rs.
-# MUST match the bindgen version wdk-build uses (0.71), so its BuilderExt
-# (Builder::wdk_default) applies to the same bindgen::Builder type we construct.
-bindgen = "0.71"
 
 [profile.dev]
 panic = "abort"
