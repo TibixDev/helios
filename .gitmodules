@@ -1,0 +1,3 @@
+[submodule "icd/mesa"]
+	path = icd/mesa
+	url = https://github.com/rupansh/mesa-helios.git
