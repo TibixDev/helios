@@ -1,6 +1,17 @@
 # Phase 5 Handover — Mesa venus → Windows ICD over Helios IOCTLs
 
-**Status: NOT STARTED. This is the implementation brief.** Everything below is concrete and
+> **✅ DONE (2026-06-05) — this brief was executed; Phase 5 works end-to-end.** The venus ICD
+> (`vn_renderer_helios.c` + the two Mesa edits) is written, committed to the fork, and validated on
+> real hardware: `vulkaninfo` shows `driverName venus` (Intel ARL + llvmpipe), `vkCreateDevice` +
+> host-visible `vkAllocateMemory`/`vkMapMemory` work, and a `vkCmdFillBuffer`+`vkQueueSubmit`+fence
+> round-trips real GPU output. Net deltas vs. this brief: the §2 opcode table had to be corrected
+> (a missing `RESOURCE_CREATE_3D` shifted SUBMIT_3D/MAP_BLOB/UNMAP_BLOB — the values are now pinned
+> to the `virtio-bindings` crate by a `cargo test`), and `info.max_timeline_count` is **64** not 1
+> (§5 said 1, which fails `vkCreateDevice` — every queue needs ring_idx≥1). **The next workstream is
+> Phase 4e async submission — see `icd/PHASE4E_ASYNC_HANDOVER.md`.** The rest of this document is kept
+> as the historical implementation brief.
+
+**Status: DONE (was: the implementation brief).** Everything below is concrete and
 verified against the actual trees (the Helios KMD on `master`, and Mesa at the pinned submodule
 commit) so the implementing agent does **not** need to re-derive it. Read this top-to-bottom, then
 ARCH.md §5/§6, then start at §6 ("The first three edits").

@@ -38,7 +38,13 @@ User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID
 | 5 Vulkan ICD | Mesa venus port over IOCTL; loader-registry JSON |
 | 6 DXVK / VKD3D | App-level validation |
 
-**STATUS (2026-06-04):** Phases 1–2 ✅ — the virtio-gpu transport (PCI cap scan, `virtio-drivers` virtqueues, `GET_DISPLAY_INFO`) is reused **unchanged** from the bring-up done under the previous model. The WDDM **AddAdapter / Code-43** approach is **abandoned**: a WDDM render adapter must pass dxgkrnl's capability/version contract for GPU scheduling + memory features that the host already owns under Venus replay — pure cost, no benefit (see `ARCH.md`). The current push is **Phase 3 = the IOCTL spine**: the default WDF queue's `EvtIoDeviceControl` plus op dispatch (the bodies port 1:1 from the old escape handlers), with an interim `fence_id`→KEVENT sync model. See `ARCH.md` for the canonical plan.
+**STATUS (2026-06-05):** Phases 0–5 ✅ — the System-class KMDF driver + IOCTL spine + the Mesa
+**venus ICD** work end-to-end on real hardware: `vulkaninfo` reports `driverName venus`, and
+`vkCreateDevice` + host-visible `vkAllocateMemory`/`vkMapMemory` + a `vkCmdFillBuffer`+`vkQueueSubmit`
+round-trip real GPU output on the Intel ARL iGPU. The WDDM AddAdapter/Code-43 approach was abandoned
+(pure cost under Venus replay). **NEXT = Phase 4e: async submission** (make `SUBMIT_VENUS`
+non-blocking; wire the `FenceTable`; poll-first then interrupt-driven), then an optimal vkcube present
+path, then DXVK/VKD3D. See **`ARCH.md` §13** (canonical status) and **`icd/PHASE4E_ASYNC_HANDOVER.md`**.
 
 **KMDF callbacks the driver registers:** `EvtDriverDeviceAdd`, `EvtDevicePrepareHardware`, `EvtDeviceReleaseHardware`, `EvtDeviceD0Entry`, `EvtDeviceD0Exit`, `EvtIoDeviceControl`, `EvtInterruptIsr`, `EvtInterruptDpc`.
 
