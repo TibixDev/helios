@@ -324,4 +324,40 @@ mod virtio_bindings_pin {
         pin!(VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE);
         pin!(VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE, VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE);
     }
+
+    /// Cross-check the size AND alignment of every on-wire struct against the
+    /// `virtio-bindings` (kernel-uapi-generated) equivalent. Size+align match is a
+    /// strong proxy for layout equivalence; combined with the identical field
+    /// order/types this guarantees the host decodes our buffers correctly.
+    macro_rules! pin_layout {
+        ($ours:ty, $theirs:ty) => {{
+            assert_eq!(
+                core::mem::size_of::<$ours>(),
+                core::mem::size_of::<$theirs>(),
+                concat!("size drift: ", stringify!($ours), " vs ", stringify!($theirs)),
+            );
+            assert_eq!(
+                core::mem::align_of::<$ours>(),
+                core::mem::align_of::<$theirs>(),
+                concat!("align drift: ", stringify!($ours), " vs ", stringify!($theirs)),
+            );
+        }};
+    }
+
+    #[test]
+    fn struct_layouts_match_virtio_bindings() {
+        use super::*;
+        pin_layout!(VirtioGpuCtrlHdr, vb::virtio_gpu_ctrl_hdr);
+        pin_layout!(VirtioGpuRect, vb::virtio_gpu_rect);
+        pin_layout!(VirtioGpuResourceUnref, vb::virtio_gpu_resource_unref);
+        pin_layout!(VirtioGpuDisplayOne, vb::virtio_gpu_resp_display_info_virtio_gpu_display_one);
+        pin_layout!(VirtioGpuRespDisplayInfo, vb::virtio_gpu_resp_display_info);
+        pin_layout!(VirtioGpuCtxCreate, vb::virtio_gpu_ctx_create);
+        pin_layout!(VirtioGpuCtxResource, vb::virtio_gpu_ctx_resource);
+        pin_layout!(VirtioGpuCmdSubmit, vb::virtio_gpu_cmd_submit);
+        pin_layout!(VirtioGpuResourceCreateBlob, vb::virtio_gpu_resource_create_blob);
+        pin_layout!(VirtioGpuResourceMapBlob, vb::virtio_gpu_resource_map_blob);
+        pin_layout!(VirtioGpuResourceUnmapBlob, vb::virtio_gpu_resource_unmap_blob);
+        pin_layout!(VirtioGpuRespMapInfo, vb::virtio_gpu_resp_map_info);
+    }
 }
