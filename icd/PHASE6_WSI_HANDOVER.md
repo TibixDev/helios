@@ -1,5 +1,14 @@
 # Phase 6 Handover — WSI windowed present (vkcube) + the present-perf BUG
 
+> ⚠️ **ABANDONED (2026-06-06) — superseded by `../DISPLAY.md` + `../PHASE7_DISPLAY_HANDOVER.md`.** The "PROPER
+> fix" this doc hunts for does not exist on this path: the Mesa `wsi_win32` software present issues **no
+> virtio-gpu scanout flush**, so the host GL backend never presents it and the <1 fps host-visibility lag is
+> architecturally unfixable here (adversarially verified against QEMU source — the §2 "host-side display-backend
+> fix" hypothesis was *refuted* as a standalone cure). Helios instead pivots to a **WDDM Display-Only Driver**
+> that owns the scanout and presents venus content **zero-copy** via **`SET_SCANOUT_BLOB`** under `-spice
+> gl=on`. This file is kept only as the record of why the software path is a dead end (its root-cause analysis
+> in §2 is correct and feeds Phase 7's §8 go/no-go gate). **Do not resume this plan.**
+
 **Status: vkcube RENDERS correctly on the spice desktop via Helios, but at <1fps. The perf
 problem is REAL and needs a PROPER fix — do NOT ship `VN_PERF=no_fence_feedback` (it reaches
 ~15fps but CORRUPTS the image: past frames overlap/tear → broken sync; the user rejected it

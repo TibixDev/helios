@@ -1,6 +1,17 @@
 # Helios Architecture v2: System-class KMDF + IOCTL + Venus
 
-**Status:** CANONICAL. This is the source of truth all the other docs are written against. It supersedes every WDDM/dxgkrnl/D3DKMTEscape passage in OVERVIEW.md, KMD.md, ICD.md, TRANSPORT.md, TOOLCHAIN.md, CLAUDE.md (HOST.md is unaffected). The WDDM render-miniport approach was abandoned 2026-06-04 (see the `systemclass-pivot` / `addadapter-umd-blocker` memories): a WDDM render adapter must pass dxgkrnl's AddAdapter capability/version contract (Code 43) for GPU scheduling + memory features that the host owns under Venus replay — pure cost, no benefit. This document is the replacement.
+> ⚠️ **DISPLAY PIVOT (2026-06-06) — for anything DISPLAY/present-related, `DISPLAY.md` is now canonical and
+> supersedes this file's driver-model framing (§1) and §8 (Presentation).** Phase 7 flips the **driver model**
+> from System-class KMDF → a **WDDM Display-Only Driver (DOD)** that owns virtio-gpu scanout 0 **and** carries
+> the venus ops over **`DxgkDdiEscape`** (IOCTL carrier reverted; byte layouts unchanged), so venus content
+> displays **directly** via **`SET_SCANOUT_BLOB`** (zero-copy dmabuf) under **`-spice gl=on`**. The
+> **virtio-gpu transport (§4), host-visible blob mapping (§6), and the Mesa venus ICD (§5)** are **reused**;
+> the System-class IOCTL channel (§2–§3) and the software/GDI present (§8) are replaced. The WDDM **render**
+> miniport stays **rejected** (it would need a multi-man-year native D3D-to-venus UMD — adversarially verified).
+> Start at `DISPLAY.md`, then `PHASE7_DISPLAY_HANDOVER.md`. The §1–§13 content below remains accurate for the
+> reused venus/transport/blob layers and as the record of the System-class phase that reached working venus.
+
+**Status:** CANONICAL (for the venus/transport/blob layers; display layer → `DISPLAY.md`). This is the source of truth all the other docs are written against. It supersedes every WDDM/dxgkrnl/D3DKMTEscape passage in OVERVIEW.md, KMD.md, ICD.md, TRANSPORT.md, TOOLCHAIN.md, CLAUDE.md (HOST.md is unaffected). The WDDM render-miniport approach was abandoned 2026-06-04 (see the `systemclass-pivot` / `addadapter-umd-blocker` memories): a WDDM render adapter must pass dxgkrnl's AddAdapter capability/version contract (Code 43) for GPU scheduling + memory features that the host owns under Venus replay — pure cost, no benefit. This document is the replacement.
 
 ## 0. The Pivot in One Paragraph
 
@@ -85,9 +96,15 @@ The blob GPA is **not** in `VirtioGpuRespMapInfo` (that carries only the `map_in
 
 The Windows Vulkan loader scans `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` (and WOW6432Node for 32-bit) for DWORD values named with the absolute path to a JSON manifest; data 0 = enabled, 1 = disabled. Required ICD exports (Mesa venus already provides): `vk_icdGetInstanceProcAddr`, `vk_icdNegotiateLoaderICDInterfaceVersion`, `vk_icdGetPhysicalDeviceProcAddr`. JSON: `{"file_format_version":"1.0.0","ICD":{"library_path":"<path to venus DLL>","api_version":"1.3.x"}}`. The KMDF universal INF cannot write absolute HKLM values, so the **ICD installer (or a postinstall script) writes the registry value** — independent of the KMD INF. **Precedent confirmed:** lavapipe (pure CPU, no GPU) and SwiftShader enumerate via exactly this mechanism with no display adapter; the loader does not require GPU/PnP/WDDM association.
 
-## 8. Presentation
+## 8. Presentation — ⚠️ SUPERSEDED by `DISPLAY.md` (2026-06-06)
 
-Headless-first. vulkaninfo (driverName "venus") → offscreen vkcube need no WSI. Windowed present, if ever required, is a **GDI StretchDIBits readback** from a mapped blob (mvisor pattern), NOT a DWM/WDDM display-driver Present path. WSI is deferred.
+**This section's plan (headless / GDI `StretchDIBits` readback) is abandoned.** It was tried (Phase 6,
+`wsi_win32` software present) and is **architecturally a dead end**: the software blit issues no virtio-gpu
+scanout flush, so the host GL backend never presents it and it eats a ~3.5 s/frame host-visibility lag (<1 fps;
+adversarially verified against QEMU source). **Replacement (canonical: `DISPLAY.md`):** Helios becomes a
+**WDDM Display-Only Driver** owning scanout 0; venus content is presented with **`SET_SCANOUT_BLOB`** of an
+exportable host-GPU venus blob (dmabuf), displayed **zero-copy, GL-accelerated** under **`-spice gl=on`**; the
+2D desktop uses the DOD present path (GL-displayed). See `DISPLAY.md` + `PHASE7_DISPLAY_HANDOVER.md`.
 
 ## 9. INF (System-class KMDF)
 
@@ -158,7 +175,7 @@ umd/                DELETE
 - **DXVK LUID interop (Phase 6):** confirm DXVK degrades gracefully when `D3DKMTOpenAdapterFromLuid` finds no WDDM adapter for the venus-reported LUID.
 - **`escape.rs` naming:** the module/types are still `HeliosEscape*`; byte layout is unchanged. Decide rename (cleaner, wide churn) vs keep-with-note.
 
-## 13. STATUS (2026-06-05) — Phases 0–5 DONE (venus ICD works end-to-end); Phase 4e async NEXT
+## 13. STATUS (2026-06-06) — Phases 0–5 + 4e async + WSI bring-up DONE; venus renders end-to-end. **NEXT = Phase 7 Display Engine (`DISPLAY.md`)**: pivot to a DOD + `SET_SCANOUT_BLOB` zero-copy present (the software WSI path of Phase 6 is abandoned — see the §8 banner). The §13 narrative below is the System-class phase record.
 
 **DONE + committed (`7a5763f`):** Phases 0+1. The System-class KMDF driver builds, packages (infverif VALID, test-signed), force-installs over the inbox `VioGpuDod` (via `devcon update … "PCI\VEN_1AF4&DEV_1050"`), and **loads cleanly: device Code 0 / System class, `GUID_DEVINTERFACE_HELIOS` opens from user mode, and `VirtioGpu::init` round-trips `GET_DISPLAY_INFO`** (transport works). New module layout per §11. Detail: the `pivot-phase01-done` memory.
 

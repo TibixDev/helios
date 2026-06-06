@@ -1,15 +1,27 @@
 # OVERVIEW.md — Helios vGPU Architecture
 
+> ⚠️ **DISPLAY PIVOT (2026-06-06):** the goal below ("no display output, headless GPU") described the
+> System-class phase, which reached **working venus rendering end-to-end**. The project now adds a **display
+> path**: Helios becomes a **WDDM Display-Only Driver (DOD)** that owns the virtio-gpu scanout and displays
+> venus content **directly** via **`SET_SCANOUT_BLOB`** (zero-copy dmabuf) under **`-spice gl=on`**. Canonical
+> spec: **`DISPLAY.md`** (+ `PHASE7_DISPLAY_HANDOVER.md`). The venus transport/ICD below is reused; the
+> "registers no display adapter" line is superseded.
+
 ## Project Goal
 
-Build a **System-class KMDF virtio-gpu driver** (the mvisor-win-vgpu pattern — **NOT** a WDDM display miniport) for a Windows 11 VM running under KVM/QEMU that:
+Build a virtio-gpu driver for a Windows 11 VM under KVM/QEMU that gives guest apps a Vulkan-capable GPU **and**
+displays the VM's output to the host with GPU acceleration. Two layers:
 
-- Exposes a Vulkan-capable GPU to guest apps via a Mesa-venus Vulkan ICD (registered through the Khronos loader registry — **no** Windows graphics-stack/display adapter)
-- Intercepts DirectX calls at the DXVK/VKD3D layer (DX → Vulkan translation happens in the guest)
-- Serializes Vulkan commands over the **virtio-gpu Venus protocol** to virglrenderer on the Linux host
-- Executes on the host's physical GPU via the host Vulkan driver (RADV, ANV, etc.)
-- Does NOT do display output and registers no display adapter — a headless GPU the Vulkan loader enumerates from the Khronos registry (like SwiftShader / Mesa lavapipe)
-- Does NOT use GPU passthrough — host retains full GPU access
+- **Render (working):** a Mesa-venus Vulkan ICD encodes Vulkan over the **virtio-gpu Venus protocol** to
+  virglrenderer on the Linux host, executing on the host's physical GPU (ANV/RADV). DirectX rides DXVK/VKD3D →
+  Vulkan in the guest. (Reached end-to-end in the System-class phase.)
+- **Display (Phase 7, `DISPLAY.md`):** Helios is a **WDDM Display-Only Driver** that owns the virtio-gpu
+  scanout — it drives the **2D Windows desktop** (DOD present path, GL-displayed) and presents **fullscreen
+  venus content zero-copy** via **`SET_SCANOUT_BLOB`** of an exportable host-GPU venus blob, displayed under
+  **`-spice gl=on`**. The venus ops ride **`DxgkDdiEscape`**.
+- Does NOT use GPU passthrough — host retains full GPU access.
+- Does NOT GPU-composite the 2D desktop (no WDDM render adapter is feasible — that needs a multi-man-year
+  native D3D-to-venus UMD; the desktop is WARP-composited, which is fine for 2D). See `DISPLAY.md` §7.
 
 ---
 
@@ -38,13 +50,16 @@ User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID
 | 5 Vulkan ICD | Mesa venus port over IOCTL; loader-registry JSON |
 | 6 DXVK / VKD3D | App-level validation |
 
-**STATUS (2026-06-05):** Phases 0–5 ✅ — the System-class KMDF driver + IOCTL spine + the Mesa
-**venus ICD** work end-to-end on real hardware: `vulkaninfo` reports `driverName venus`, and
+**STATUS (2026-06-06):** Phases 0–5 + 4e async + WSI bring-up ✅ — the System-class KMDF driver + the Mesa
+**venus ICD** render end-to-end on real hardware: `vulkaninfo` reports `driverName venus`, and
 `vkCreateDevice` + host-visible `vkAllocateMemory`/`vkMapMemory` + a `vkCmdFillBuffer`+`vkQueueSubmit`
-round-trip real GPU output on the Intel ARL iGPU. The WDDM AddAdapter/Code-43 approach was abandoned
-(pure cost under Venus replay). **NEXT = Phase 4e: async submission** (make `SUBMIT_VENUS`
-non-blocking; wire the `FenceTable`; poll-first then interrupt-driven), then an optimal vkcube present
-path, then DXVK/VKD3D. See **`ARCH.md` §13** (canonical status) and **`icd/PHASE4E_ASYNC_HANDOVER.md`**.
+round-trip real GPU output on the Intel ARL iGPU; vkcube even renders via the software WSI path (but at
+<1 fps — that path is now abandoned). The WDDM **render** miniport stays abandoned (Code-43 / needs a
+multi-man-year D3D-to-venus UMD). **NEXT = Phase 7: the Display Engine** — flip the driver model to a **WDDM
+Display-Only Driver** and present venus content **zero-copy** via **`SET_SCANOUT_BLOB`** under `-spice gl=on`.
+Canonical: **`DISPLAY.md`** + **`PHASE7_DISPLAY_HANDOVER.md`** (do the §8 go/no-go gate first). The driver
+model, present path, and the venus carrier (IOCTL → `DxgkDdiEscape`) all change; the venus/transport core is
+reused.
 
 **KMDF callbacks the driver registers:** `EvtDriverDeviceAdd`, `EvtDevicePrepareHardware`, `EvtDeviceReleaseHardware`, `EvtDeviceD0Entry`, `EvtDeviceD0Exit`, `EvtIoDeviceControl`, `EvtInterruptIsr`, `EvtInterruptDpc`.
 

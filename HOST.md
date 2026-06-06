@@ -143,10 +143,10 @@ GRUB_CMDLINE_LINUX="... amd_iommu=on iommu=pt"
 Set these before launching QEMU:
 
 ```bash
-# Enable Venus-specific debug output
-export VIRGL_DEBUG=venus           # basic Venus logging
-export VIRGL_DEBUG=venus,1         # verbose Venus logging
-export VIRGL_LOG_FILE=/tmp/virgl.log
+# NOTE: VIRGL_DEBUG (=venus / =verbose / etc.) does NOT produce readable logs in
+# the libvirt + venus render-server setup — venus runs in the virgl_render_server
+# child process whose stderr is not captured (user-confirmed 2026-06-06). Do not
+# rely on it for host-side venus tracing.
 
 # Force specific host Vulkan device (useful for multi-GPU hosts)
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
@@ -238,18 +238,16 @@ Venus in virglrenderer runs in a separate process/thread per context. For best p
 
 ## 5. Venus Protocol Verification
 
-### 5.1 Using VIRGL_DEBUG to trace commands
+### 5.1 Host-side venus tracing — VIRGL_DEBUG does NOT work here
 
-```bash
-export VIRGL_DEBUG=venus,vtest
-# Then in the VM, any Venus command will print to stderr on the host.
-# These traces are independent of how the guest carries the Venus stream
-# (the guest's transport carrier is invisible to the host) — only the
-# decoded Venus commands matter here.
-# Output example:
-# [venus] vkCreateInstance (ctx=1)
-# [venus] vkEnumeratePhysicalDevices (ctx=1) -> 1 device(s)
-```
+> ⚠️ **`VIRGL_DEBUG` (any value) produces no readable logs in this setup** (libvirt
+> `qemu:///system` + venus render-server) — user-confirmed 2026-06-06. venus runs in
+> the separate `virgl_render_server` child process whose stderr / `VIRGL_DEBUG`
+> output is not captured into `/var/log/libvirt/qemu/win11.log`. The QEMU log still
+> captures QEMU-level `LOG_GUEST_ERROR` (`-d guest_errors`, e.g. a `RESP_ERR_*`), but
+> not virglrenderer/venus decode traces. For host-side venus diagnostics, capture the
+> render-server child's stderr directly or build virglrenderer with logging — not
+> `VIRGL_DEBUG`.
 
 ### 5.2 Host Vulkan API Validation
 

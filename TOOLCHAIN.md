@@ -435,12 +435,11 @@ unsafe { KdPrint!("Helios: adapter started\n\0"); }
 
 ### virglrenderer Logging (Host Side)
 
-```bash
-# Set environment variable before launching QEMU:
-export VIRGL_DEBUG=venus,1
-export VIRGL_LOG_LEVEL=debug
-./launch-vm.sh 2>&1 | tee virgl.log
-```
+> ⚠️ **`VIRGL_DEBUG` does NOT produce readable logs** in the libvirt
+> `qemu:///system` + venus render-server setup (user-confirmed 2026-06-06): venus
+> runs in the `virgl_render_server` child whose stderr isn't captured. See HOST.md
+> §5.1. Use QEMU `-d guest_errors` for `RESP_ERR_*`; for venus traces, capture the
+> render-server child's stderr directly or build virglrenderer with logging.
 
 ---
 
