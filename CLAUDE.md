@@ -168,7 +168,8 @@ abandoned Phase-6 software-WSI present.)
       canonical reference is the **Microsoft KMDOD sample** (`Windows-driver-samples/video/KMDOD`).
       **7.1b IN PROGRESS** — real VidPN + present ported from KMDOD (`ca8af7f`); the monitor enumerates but
       `CommitVidPn`/`Present` don't fire (an `EnumVidPnCofuncModality` bug). See `PHASE7_DISPLAY_HANDOVER.md` §0
-      + the `dod-7-1a-loads` memory. (`gtk,gl=on` fails `eglMakeCurrent` on this host; 2D needs no GL.)
+      + the `dod-7-1a-loads` memory. (Viewer: run `tools/launch-helios-gtk.sh` as your user; `gtk,gl=on`
+      eglMakeCurrent in the standalone is UNRESOLVED — default `HELIOS_DISPLAY=gtk` software, or spice.)
 - [ ] **7.2 Venus over `DxgkDdiEscape`:** port the escape dispatch (body = today's `ioctl.rs`); switch the Mesa
       `vn_renderer_helios` transport to `D3DKMTOpenAdapterFromLuid` + `D3DKMTEscape`.
 - [ ] **7.3 Fullscreen present:** `HELIOS_PRESENT_BLOB` escape op + scanout-0 arbiter (desktop ⇄ venus blob),

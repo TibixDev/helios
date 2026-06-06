@@ -45,13 +45,16 @@ assigns==0 ⇒ create/assign failed; assigns set but no commit ⇒ **mode-set CO
 `VideoSignalInfo` PixelRate / the preference union; source PrimSurfSize/VisibleRegionSize/Stride). Then expand
 `MODE_TABLE` (currently one 1024x768).
 
-**Viewing (the host display backend, independent of the commit bug):** `gtk,gl=on` is dead on this multi-GPU
-Wayland host (repeating `eglMakeCurrent failed` — qemu/host EGL, not Helios). The 2D DOD desktop needs no GL.
-`tools/launch-helios-gtk.sh` (standalone qemu, **virtio-gpu = sole/primary display**) now selects the backend
-via `$HELIOS_DISPLAY`: default `gtk` (software), or `spice` (`-spice :5930`; view `remote-viewer
-spice://127.0.0.1:5930` — no QXL in the standalone so spice binds the virtio-gpu console, sidestepping the EGL
-issue). `HELIOS_SPICE_GL=on` only for the venus dmabuf path (7.3). Requires `sudo` (the owner runs it) and the
-libvirt VM shut off first; restart libvirt after.
+**Viewing — `gtk,gl=on` eglMakeCurrent is UNRESOLVED (an open task; do not assume a cause).** `gtk,gl=on` in the
+standalone floods `Gdk-WARNING eglMakeCurrent failed` (black window). Two observations only, NOT a diagnosis:
+(a) `gl=on` works in a separate minimal qemu launch (q35 + one virtio-gpu-gl-pci + an Ubuntu ISO) on this host;
+(b) changing `tools/launch-helios-gtk.sh` to run as the desktop user with the full session env (it no longer
+sudo-re-execs with a stripped env) did NOT change the failure. Root cause unknown — the next session must figure
+it out. Until then the launcher (run it as your user: `bash tools/launch-helios-gtk.sh`; libvirt win11 off
+first, restart after) defaults to `$HELIOS_DISPLAY=gtk` (software, no EGL — can display the 2D desktop without
+GL); use `gtk,gl=on,show-cursor=on` to reproduce the bug, or `spice` (`-spice :5930`, `remote-viewer
+spice://127.0.0.1:5930`). NB: `gl=on` is needed for the venus dmabuf path (7.3), so this must be solved before
+then.
 
 **Then Phase 7.2** — venus over `DxgkDdiEscape`: the DOD's `DxgkDdiEscape` is a NOT_SUPPORTED stub; port the
 body from the deleted System-class `kmd/src/ioctl.rs` (recover via git), and re-wire the Mesa

@@ -297,9 +297,11 @@ Only after this gate passes do you flip the driver model to a DOD (§3) and wire
   (commit `b3eb40f`; `Version=DXGKDDI_INTERFACE_VERSION` native, `displib.lib` stays, `DxgkDdiResetDevice`
   mandatory). **7.1b IN PROGRESS** — real VidPN + present (KMDOD-ported, `ca8af7f`); the Helios monitor
   enumerates, but `CommitVidPn`/`PresentDisplayOnly` don't fire yet (an `EnumVidPnCofuncModality`
-  cofunctional-VidPN bug). See `PHASE7_DISPLAY_HANDOVER.md` §0 + the `dod-7-1a-loads` memory. Host viewer note:
-  `gtk,gl=on` fails `eglMakeCurrent` on this multi-GPU host; the 2D desktop needs no GL — use
-  `tools/launch-helios-gtk.sh` with `$HELIOS_DISPLAY` = `gtk` (software) or `spice`.
+  cofunctional-VidPN bug). See `PHASE7_DISPLAY_HANDOVER.md` §0 + the `dod-7-1a-loads` memory. Host viewer:
+  `gtk,gl=on` floods `eglMakeCurrent failed` in the standalone — **UNRESOLVED** (it works in a minimal qemu
+  launch on this host, and running the script as the user with the full env didn't change it; root cause
+  unknown — next session). Run `tools/launch-helios-gtk.sh` as your user; default `$HELIOS_DISPLAY=gtk`
+  (software, no GL — displays the 2D desktop) or `spice`.
 - **7.2 — Venus over `DxgkDdiEscape`:** port the escape dispatch body back; switch the Mesa
   `vn_renderer_helios` transport to `D3DKMTEscape`. Gate: `vulkaninfo`/`helios_vk_exec` pass through the DOD
   (the Phase-5 gate, now over escape) — `vkQueueWaitIdle => 0`, `vkCmdFillBuffer` round-trip `0xDEADBEEF`.

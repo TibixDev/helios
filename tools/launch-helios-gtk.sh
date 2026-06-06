@@ -1,48 +1,55 @@
 #!/usr/bin/env bash
-# tools/launch-helios-gtk.sh — standalone QEMU for win11, native Wayland, as the
-# desktop user. Pure virtio-gpu-gl-pci (no VGA/QXL) so the Helios DOD is the SOLE
-# (primary) display. virtiofs shares the repo as Z:\ so builds work in-VM.
-#   sudo bash tools/launch-helios-gtk.sh        # libvirt win11 must be shut off first
+# tools/launch-helios-gtk.sh — standalone QEMU for win11 (native Wayland). Pure
+# virtio-gpu-gl-pci (no VGA/QXL) so the Helios DOD is the SOLE (primary) display.
+# virtiofs shares the repo as Z:\ so builds work in-VM.
 #
-# Display backend: $HELIOS_DISPLAY (default "gtk" = software, NO GL). The 2D DOD
-# desktop scanout displays fine without GL. `gl=on` is only needed for the venus
-# zero-copy dmabuf path (Phase 7.3) and currently fails on this multi-GPU Wayland
-# host with repeating `Gdk-WARNING eglMakeCurrent failed` (a qemu-gtk/host EGL
-# issue, not Helios). For the venus path use: HELIOS_DISPLAY=gtk,gl=on sudo -E ...
+#   bash tools/launch-helios-gtk.sh        # run as YOUR user (NOT sudo); libvirt
+#                                          # win11 must be shut off first.
+#
+# Runs as your normal desktop user (NOT sudo) so QEMU inherits the full Wayland/EGL
+# session env; the privileged steps (tap on virbr0, chown the libvirt disk/nvram,
+# copy the swtpm state) are sudo'd individually below (password prompt once).
+#
+# ⚠️ UNRESOLVED (next session): `gtk,gl=on` here floods `Gdk-WARNING eglMakeCurrent
+# failed` (black window). Observations only, NOT a diagnosis: gl=on does work in a
+# separate minimal qemu launch on this host with an ubuntu live boot iso in qemu)
+# and running this script as the user
+# with the full session env did not change the failure. Root cause is unknown —
+# investigate. Until resolved, use a non-GL backend (default below).
+#
+# Display backend: $HELIOS_DISPLAY (default "gtk" = software display, NO EGL — shows
+# the 2D DOD desktop scanout without the gl=on eglMakeCurrent issue). Set
+# "gtk,gl=on,show-cursor=on" to reproduce/debug the eglMakeCurrent bug, or "spice".
 set -uo pipefail
-USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
+[ "$(id -u)" -ne 0 ] || { echo "run as your NORMAL user (not sudo/root) — the privileged steps are sudo'd internally"; exit 1; }
+USER_NAME=$(id -un); USER_UID=$(id -u)
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
-if [ "${HELIOS_PHASE:-}" != "user" ]; then
-  [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
-  cleanup() { ip link del heltap0 2>/dev/null||true; chown libvirt-qemu:libvirt-qemu "$DISK" "$NVRAM" 2>/dev/null||true; }
-  trap cleanup EXIT INT TERM
-  chown "$USER_NAME" "$DISK" "$NVRAM"
-  mkdir -p "$TPMDIR/state"; cp -a "$SWSRC"/. "$TPMDIR/state/" 2>/dev/null || echo "WARN fresh TPM"
-  chown -R "$USER_NAME" "$TPMDIR"
-  ip link del heltap0 2>/dev/null||true; ip tuntap add dev heltap0 mode tap user "$USER_NAME"
-  ip link set heltap0 master virbr0 && ip link set heltap0 up
-  sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
-    WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=wayland \
-    HELIOS_DISPLAY="${HELIOS_DISPLAY:-gtk}" bash "$0"
-  exit $?
-fi
-# ---- user phase (desktop user, native Wayland) ----
+cleanup() { sudo ip link del heltap0 2>/dev/null||true; sudo chown libvirt-qemu:libvirt-qemu "$DISK" "$NVRAM" 2>/dev/null||true; }
+trap cleanup EXIT INT TERM
+echo ">>> privileged setup (sudo: chown disk/nvram + swtpm state + tap on virbr0) <<<"
+sudo chown "$USER_NAME" "$DISK" "$NVRAM"
+sudo mkdir -p "$TPMDIR/state"; sudo cp -a "$SWSRC"/. "$TPMDIR/state/" 2>/dev/null || echo "WARN fresh TPM"
+sudo chown -R "$USER_NAME" "$TPMDIR"
+sudo ip link del heltap0 2>/dev/null||true; sudo ip tuntap add dev heltap0 mode tap user "$USER_NAME"
+sudo ip link set heltap0 master virbr0 && sudo ip link set heltap0 up
+# ---- services + QEMU, in the user's full session env ----
 pkill -f 'virtiofsd.*helios-tpm' 2>/dev/null||true; pkill -f 'swtpm.*helios-tpm' 2>/dev/null||true
 /usr/lib/virtiofsd --shared-dir "$SHARE" --socket-path "$TPMDIR/fs.sock" --tag helios-vgpu --sandbox none &
 /usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon
 sleep 1
-# Display backend (HELIOS_DISPLAY): "spice" → -spice on :5930 (view with
-# `remote-viewer spice://127.0.0.1:5930`; no QXL here so spice binds the sole
-# virtio-gpu console — sidesteps the gtk eglMakeCurrent issue). Spice GL is off by
-# default (software 2D display); HELIOS_SPICE_GL=on for the venus dmabuf path.
-# Anything else is a -display value (default "gtk" = software, no EGL).
-if [ "${HELIOS_DISPLAY:-gtk}" = spice ]; then
+# Display backend (HELIOS_DISPLAY): default "gtk" = SOFTWARE display (no EGL), which
+# shows the 2D DOD desktop scanout without the unsolved gl=on eglMakeCurrent issue.
+# Use "gtk,gl=on,show-cursor=on" to reproduce/debug that bug. "spice" → -spice on
+# :5930 (view `remote-viewer spice://127.0.0.1:5930`); HELIOS_SPICE_GL controls its
+# GL (default off = software). Anything else is passed verbatim as -display.
+DISPLAY_BACKEND="${HELIOS_DISPLAY:-gtk}"
+if [ "$DISPLAY_BACKEND" = spice ]; then
   DISP=(-spice "port=5930,addr=127.0.0.1,disable-ticketing=on,gl=${HELIOS_SPICE_GL:-off}" -display none)
   echo '>>> QEMU (spice :5930, virtio-gpu SOLE display). View: remote-viewer spice://127.0.0.1:5930. SSH .120 <<<'
 else
-  DISP=(-display "${HELIOS_DISPLAY:-gtk}")
-  echo ">>> QEMU (display=${HELIOS_DISPLAY:-gtk}, virtio-gpu SOLE display). Z:\\ = repo. SSH .120 <<<"
+  DISP=(-display "$DISPLAY_BACKEND")
+  echo ">>> QEMU (display=$DISPLAY_BACKEND, virtio-gpu SOLE display). Z:\\ = repo. SSH .120 <<<"
 fi
 exec /usr/bin/qemu-system-x86_64 \
   -name \
