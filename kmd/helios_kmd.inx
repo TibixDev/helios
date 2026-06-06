@@ -1,16 +1,28 @@
-; helios_kmd.inx — Helios vGPU System-class KMDF function driver.
+; helios_kmd.inx — Helios vGPU WDDM Display-Only Driver (DOD).
 ;
-; Binds the virtio-gpu PCI device (VEN_1AF4 & DEV_1050) as a System-class
-; (NOT display/WDDM) KMDF function driver. It exposes GUID_DEVINTERFACE_HELIOS
-; (registered in code via WdfDeviceCreateDeviceInterface) for the Venus IOCTL
-; channel; there is no UserModeDriverName / InstalledDisplayDrivers / Video
-; load-order group. See ARCH.md §9. The wdk-build toolchain stamps DriverVer and
-; produces helios_kmd.inf during packaging.
+; Binds the virtio-gpu PCI device (VEN_1AF4 & DEV_1050) as a WDDM Display-Only
+; Driver (Class = Display). The miniport owns the virtio-gpu scanout and presents
+; the Windows desktop on the SPICE display; it carries the Venus protocol over
+; DxgkDdiEscape (Phase 7.2). No IOCTL device interface, no user-mode driver.
+;
+; NOT a KMDF driver: a DOD is a dxgkrnl miniport (WDM model,
+; DxgkInitializeDisplayOnlyDriver from displib.lib) — so there is deliberately NO
+; [<svc>.Wdf] / KmdfService directive and no $KMDFVERSION$. `driver-type = "WDM"`
+; in kmd/Cargo.toml makes wdk-build's stampinf drop the -k KMDF flag.
+;
+; A DOD needs NO UserModeDriverName / InstalledDisplayDrivers: there is no WDDM
+; render UMD. D3D/DXVK reach venus purely through the Khronos Vulkan ICD JSON
+; (the Mesa-venus ICD, registered separately under HKLM\SOFTWARE\Khronos\Vulkan\
+; Drivers). UMD-less DODs load and present fine (precedent: qxldod, VioGpuDod,
+; BasicDisplay). See DISPLAY.md §3.1.
+;
+; The wdk-build toolchain stamps DriverVer and produces helios_kmd.inf during
+; packaging. Force-installs over the inbox VioGpuDod via devcon update.
 
 [Version]
 Signature   = "$Windows NT$"
-Class       = System
-ClassGUID   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Class       = Display
+ClassGUID   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = helios_kmd.cat
 PnpLockdown = 1
@@ -27,8 +39,7 @@ helios_kmd.sys = 1,,
 ; ──── Manufacturer / Models ────────────────────────────────────────────────
 
 ; TargetOSVersion decoration (...16299 = Win10 1709): required because the
-; install section copies to DIRID 13 (driver store) and uses an inbox KMDF
-; coinstaller-free package, both introduced in 10.0.16299.
+; install section copies to DIRID 13 (driver store), introduced in 10.0.16299.
 [Manufacturer]
 %ProviderName% = Helios_Models,NTamd64.10.0...16299
 
@@ -37,42 +48,39 @@ helios_kmd.sys = 1,,
 
 ; ──── Installation ─────────────────────────────────────────────────────────
 
-[Helios_Install.NT]
-CopyFiles = Helios_CopyFiles
+[Helios_Install]
+FeatureScore = F9                    ; out-rank the inbox VioGpuDod (lower = better)
+CopyFiles    = Helios_CopyFiles
 
 [Helios_CopyFiles]
 helios_kmd.sys
 
-[Helios_Install.NT.Services]
+[Helios_Install.Services]
 AddService = helios_kmd, 0x00000002, Helios_ServiceInstall  ; SPSVCINST_ASSOCSERVICE
 
 [Helios_ServiceInstall]
 ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
 StartType      = 3                   ; SERVICE_DEMAND_START
-ErrorControl   = 1                   ; SERVICE_ERROR_NORMAL
+ErrorControl   = 0                   ; SERVICE_ERROR_IGNORE (a failed display
+                                     ; driver must not bugcheck boot)
 ServiceBinary  = %13%\helios_kmd.sys
+LoadOrderGroup = Video
 
-; ──── KMDF directive ───────────────────────────────────────────────────────
-; Declares the KMDF library dependency for the service. $KMDFVERSION$ resolves
-; to the target KMDF version (1.33) at packaging time. Inbox KMDF on Win10
-; 1709+ — NO CoInstallers section / WdfCoInstaller DLL (forbidden in a
-; universal INF).
+; ──── Display device software key (HKR) ────────────────────────────────────
+; Minimal display settings the DOD code may read. NO InstalledDisplayDrivers /
+; UserModeDriverName — a DOD has no WDDM render UMD (see header).
 
-[Helios_Install.NT.Wdf]
-KmdfService = helios_kmd, helios_wdfsect
+[Helios_Install.SoftwareSettings]
+AddReg = Helios_SoftwareSettings_Reg
 
-[helios_wdfsect]
-KmdfLibraryVersion = $KMDFVERSION$
-
-; ──── Vulkan ICD registration ──────────────────────────────────────────────
-; The Windows Vulkan loader enumerates the (separate) Mesa-venus ICD purely via
-; HKLM\SOFTWARE\Khronos\Vulkan\Drivers JSON — written by the ICD's own
-; installer, not by this KMD package (a universal INF cannot write absolute
-; HKLM values). See ARCH.md §7.
+[Helios_SoftwareSettings_Reg]
+HKR,, HWCursor, %REG_DWORD%, 0
 
 ; ──── Strings ──────────────────────────────────────────────────────────────
 
 [Strings]
 ProviderName = "Helios Project"
-DeviceDesc   = "Helios vGPU (virtio-gpu / Venus)"
+DeviceDesc   = "Helios vGPU Display (virtio-gpu / Venus)"
 DiskName     = "Helios vGPU Driver Disk"
+
+REG_DWORD    = 0x00010001

@@ -7,7 +7,7 @@
 //! `AdapterContext::virtio`.
 //!
 //! Bring-up (all in `init`, at PASSIVE_LEVEL):
-//!   M1 — `KmdfConfigAccess` (over BUS_INTERFACE_STANDARD) → `PciRoot` →
+//!   M1 — `DxgkConfigAccess` (over BUS_INTERFACE_STANDARD) → `PciRoot` →
 //!        `PciTransport::new::<WdkHal,_>`
 //!   M2 — feature negotiation via the `Transport` trait
 //!   M3 — control `VirtQueue::<WdkHal>` setup + DRIVER_OK
@@ -25,11 +25,15 @@ use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
-    VirtioGpuCtxResource, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
-    VirtioGpuResourceMapBlob, VirtioGpuRespDisplayInfo, VirtioGpuRespMapInfo,
-    VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
-    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
+    VirtioGpuCtxResource, VirtioGpuMemEntry, VirtioGpuRect, VirtioGpuResourceAttachBacking,
+    VirtioGpuResourceCreate2d, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
+    VirtioGpuResourceMapBlob, VirtioGpuResourceUnref, VirtioGpuRespDisplayInfo, VirtioGpuRespMapInfo,
+    VirtioGpuSetScanout, VirtioGpuSetScanoutBlob, VirtioGpuTransferToHost2d,
+    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_2D, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_FLUSH, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF,
+    VIRTIO_GPU_CMD_SET_SCANOUT, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
+    VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
@@ -42,7 +46,7 @@ use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
 use virtio_drivers::Error as VirtError;
 
-use super::config::KmdfConfigAccess;
+use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, WdkHal};
 use super::VirtioError;
 
@@ -108,7 +112,7 @@ pub struct BlobMapPrep {
 /// virtio-drivers' `PciTransport` ignores cap type 8, so we scan it ourselves
 /// over the bus interface. Returns `None` if absent (a device built without
 /// blob/hostmem), which makes `MAP_BLOB` unavailable rather than crashing.
-fn scan_host_visible_window(access: &KmdfConfigAccess) -> Option<HostVisibleWindow> {
+fn scan_host_visible_window(access: &DxgkConfigAccess) -> Option<HostVisibleWindow> {
     if (access.read32(PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
         return None;
     }
@@ -145,7 +149,7 @@ fn scan_host_visible_window(access: &KmdfConfigAccess) -> Option<HostVisibleWind
 
 /// Read the guest-physical base a memory BAR was assigned, handling the 64-bit
 /// (type 0b10) layout the prefetchable host-visible window uses.
-fn bar_base(access: &KmdfConfigAccess, bar: u16) -> Option<u64> {
+fn bar_base(access: &DxgkConfigAccess, bar: u16) -> Option<u64> {
     if bar > 5 {
         return None;
     }
@@ -343,15 +347,28 @@ pub struct VirtioGpu {
     /// that means it has completed. Drives `IOCTL_HELIOS_WAIT_FENCE`
     /// (out-of-order-safe — see [`VirtioGpu::fence_complete`]).
     max_submitted_fence_id: u64,
+    /// Persistent, physically-contiguous guest framebuffer backing the 2D desktop
+    /// scanout resource (`DESKTOP_RES_ID`). Allocated once per mode in
+    /// [`set_desktop_mode`]; `DxgkDdiPresentDisplayOnly` blts the desktop primary
+    /// into it, then `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` push it to the host
+    /// scanout (Phase 7.1 DOD desktop path). `None` until the first mode set.
+    desktop_fb: Option<DmaBuffer>,
+    /// Current desktop mode width/height (pixels); valid iff `desktop_fb.is_some()`.
+    desktop_w: u32,
+    desktop_h: u32,
 }
+
+/// Fixed virtio-gpu resource id for the 2D desktop scanout. Held well clear of
+/// the blob path's allocator (`RESOURCE_ID_BASE = 0x1000`+) so it never collides.
+const DESKTOP_RES_ID: u32 = 0x100;
 
 impl VirtioGpu {
     /// Bring the virtio-gpu device online and prove it with `GET_DISPLAY_INFO`.
-    pub fn init(access: &KmdfConfigAccess) -> Result<Self, VirtioError> {
+    pub fn init(access: &DxgkConfigAccess) -> Result<Self, VirtioError> {
         // ── M1: discover the device + map BARs through the bus interface ────
         // A function driver doesn't own the bus, so config space is reached via
         // the PCI bus's BUS_INTERFACE_STANDARD (GetBusData/SetBusData); the
-        // DeviceFunction is a formality (KmdfConfigAccess ignores it and
+        // DeviceFunction is a formality (DxgkConfigAccess ignores it and
         // addresses our own device via the bus-interface context). BAR MMIO is
         // mapped on demand by WdkHal inside PciTransport::new.
         let mut root = PciRoot::new(*access);
@@ -459,6 +476,9 @@ impl VirtioGpu {
             next_window_offset: 0,
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             max_submitted_fence_id: 0,
+            desktop_fb: None,
+            desktop_w: 0,
+            desktop_h: 0,
         })
     }
 
@@ -632,6 +652,197 @@ impl VirtioGpu {
         cmd.r = VirtioGpuRect { x: 0, y: 0, width, height };
         cmd.resource_id = resource_id;
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    // ── 2D desktop scanout (Phase 7.1 DOD desktop path) ─────────────────────
+    // The non-blob 2D scanout: a guest-page-backed BGRX resource the DOD paints
+    // the Windows desktop primary into, displayed by the host under `-spice
+    // gl=on`. All device-global (`hdr.ctx_id = 0`); each low-level helper drains
+    // the async venus pool first (`quiesce_into`) exactly like the blob path.
+
+    /// `VIRTIO_GPU_CMD_RESOURCE_CREATE_2D` — create a host-side 2D resource.
+    fn resource_create_2d(
+        &mut self,
+        resource_id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let mut cmd = VirtioGpuResourceCreate2d::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+        cmd.resource_id = resource_id;
+        cmd.format = format;
+        cmd.width = width;
+        cmd.height = height;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    /// `VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING` with a single contiguous run.
+    /// The header + one `VirtioGpuMemEntry` (48 bytes total) are sent as one
+    /// device-read buffer; a contiguous framebuffer needs exactly one entry.
+    fn attach_backing_contiguous(
+        &mut self,
+        resource_id: u32,
+        addr: u64,
+        length: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let mut hdr = VirtioGpuResourceAttachBacking::zeroed();
+        hdr.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+        hdr.resource_id = resource_id;
+        hdr.nr_entries = 1;
+        let entry = VirtioGpuMemEntry { addr, length, padding: 0 };
+        // header (32) || entry (16) contiguous — the device reads one buffer.
+        let mut buf = [0u8; 48];
+        buf[..32].copy_from_slice(bytemuck::bytes_of(&hdr));
+        buf[32..].copy_from_slice(bytemuck::bytes_of(&entry));
+        self.ctrl_roundtrip(&buf)
+    }
+
+    /// `VIRTIO_GPU_CMD_SET_SCANOUT` — bind a 2D resource to a scanout (or detach
+    /// with `resource_id = 0`).
+    fn set_scanout(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let mut cmd = VirtioGpuSetScanout::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT;
+        cmd.r = VirtioGpuRect { x: 0, y: 0, width, height };
+        cmd.scanout_id = scanout_id;
+        cmd.resource_id = resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    /// `VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D` — push a rect of the resource's guest
+    /// backing into the host copy. `offset` is the byte offset of (x,y).
+    fn transfer_to_host_2d(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        offset: u64,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let mut cmd = VirtioGpuTransferToHost2d::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+        cmd.r = VirtioGpuRect { x, y, width, height };
+        cmd.offset = offset;
+        cmd.resource_id = resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    /// `VIRTIO_GPU_CMD_RESOURCE_UNREF` — free a host resource.
+    fn resource_unref(
+        &mut self,
+        resource_id: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let mut cmd = VirtioGpuResourceUnref::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+        cmd.resource_id = resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    /// Install a desktop scanout mode (W×H, BGRX) on scanout 0. `new_fb` is a
+    /// caller-allocated (PASSIVE) physically-contiguous buffer ≥ `W*H*4` that
+    /// backs the 2D resource. Tears down any prior scanout, then
+    /// CREATE_2D → ATTACH_BACKING → SET_SCANOUT(0).
+    ///
+    /// Returns the **old** framebuffer (if any) for the caller to drop at
+    /// PASSIVE_LEVEL — a `DmaBuffer` must never be freed here under the virtio
+    /// spinlock (DISPATCH). The new fb is installed regardless of command
+    /// outcome (so it is owned + freed at transport teardown), so the command
+    /// Result is returned alongside the old fb rather than via `?`.
+    pub fn set_desktop_mode(
+        &mut self,
+        new_fb: DmaBuffer,
+        width: u32,
+        height: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> (Option<DmaBuffer>, Result<(), VirtioError>) {
+        let addr = new_fb.phys();
+        let length = (width as u64).saturating_mul(height as u64).saturating_mul(4) as u32;
+        let had_prior = self.desktop_fb.is_some();
+        // Install the new fb first (so it is owned and freed at PASSIVE on
+        // teardown even if a command below fails); extract the old fb to return.
+        let old = self.desktop_fb.replace(new_fb);
+        self.desktop_w = width;
+        self.desktop_h = height;
+        // Best-effort detach + unref of the prior host resource so it releases
+        // the old fb's pages before the caller drops `old`.
+        if had_prior {
+            let _ = self.set_scanout(0, 0, 0, 0, retired);
+            let _ = self.resource_unref(DESKTOP_RES_ID, retired);
+        }
+        let result = (|| {
+            self.resource_create_2d(
+                DESKTOP_RES_ID,
+                VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+                width,
+                height,
+                retired,
+            )?;
+            self.attach_backing_contiguous(DESKTOP_RES_ID, addr, length, retired)?;
+            self.set_scanout(0, DESKTOP_RES_ID, width, height, retired)
+        })();
+        (old, result)
+    }
+
+    /// True once a desktop scanout mode has been installed.
+    pub fn desktop_ready(&self) -> bool {
+        self.desktop_fb.is_some()
+    }
+
+    /// Current desktop scanout geometry `(width, height)`, or `(0, 0)` if no mode
+    /// has been installed yet.
+    pub fn desktop_dims(&self) -> (u32, u32) {
+        if self.desktop_fb.is_some() {
+            (self.desktop_w, self.desktop_h)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Blt the present source surface (full frame) into the desktop framebuffer,
+    /// then push it to the host scanout (`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`
+    /// of the whole frame). `src` is the system-memory desktop primary (locked
+    /// non-paged for the present); `src_pitch` its row stride in bytes. Per-row
+    /// copy handles src/dst pitch mismatch. (Dirty-rect optimization deferred —
+    /// first light pushes the full frame.)
+    pub fn present_desktop(
+        &mut self,
+        src: &[u8],
+        src_pitch: usize,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        let (w, h) = (self.desktop_w, self.desktop_h);
+        let dst_pitch = (w as usize).saturating_mul(4);
+        let copy_bytes = dst_pitch.min(src_pitch);
+        {
+            let fb = self.desktop_fb.as_mut().ok_or(VirtioError::DeviceError)?;
+            let dst = fb.as_mut_slice();
+            for y in 0..h as usize {
+                let so = y.saturating_mul(src_pitch);
+                let doo = y.saturating_mul(dst_pitch);
+                if so + copy_bytes <= src.len() && doo + copy_bytes <= dst.len() {
+                    dst[doo..doo + copy_bytes].copy_from_slice(&src[so..so + copy_bytes]);
+                }
+            }
+        }
+        self.transfer_to_host_2d(DESKTOP_RES_ID, 0, 0, w, h, 0, retired)?;
+        self.resource_flush(DESKTOP_RES_ID, w, h, retired)
     }
 
     /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`

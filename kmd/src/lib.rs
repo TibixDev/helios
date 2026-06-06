@@ -1,17 +1,20 @@
 //! Helios vGPU kernel-mode driver (KMD).
 //!
-//! A **System-class KMDF function driver** for the virtio-gpu PCI device
-//! (VEN_1AF4 & DEV_1050). It is NOT a WDDM/display miniport: there is no
-//! dxgkrnl, no DDI table, no GPU-VA contract. `DriverEntry` registers
-//! `evt_device_add` via `WdfDriverCreate`; from there WDF drives the device
-//! lifecycle (pnp.rs). User mode (the Mesa-venus Vulkan ICD) reaches the driver
-//! via `DeviceIoControl` on `GUID_DEVINTERFACE_HELIOS`, carrying the six
-//! `helios_protocol` ops as IOCTLs (ioctl.rs). See ARCH.md (canonical).
+//! A **WDDM Display-Only Driver (DOD)** for the virtio-gpu PCI device
+//! (VEN_1AF4 & DEV_1050). `DriverEntry` registers the DOD DDI table with dxgkrnl
+//! via `DxgkInitializeDisplayOnlyDriver`; dxgkrnl then drives the device
+//! lifecycle through the callbacks in `dod.rs`. The driver owns the virtio-gpu
+//! scanout and presents the Windows desktop to the host (SPICE) over a 2D
+//! scanout; the venus ops ride `DxgkDdiEscape` (Phase 7.2). See DISPLAY.md.
 //!
-//! Bring-up status: **Phase 1** — System-class KMDF skeleton + the virtio
-//! transport re-homed onto the KMDF device + the IOCTL control verbs
-//! (CTX_CREATE/DESTROY/SUBMIT_VENUS/WAIT_FENCE). Blob verbs and the async-fence
-//! DPC land in Phases 3–4.
+//! Phase-7 display pivot (DISPLAY.md §3): this replaces the System-class KMDF
+//! function-driver model. The virtio transport (`virtio/`), the `helios_protocol`
+//! wire crate, and the Mesa venus ICD are reused unchanged.
+//!
+//! Bring-up status: **Phase 7.1** — DOD skeleton: loads as a Display adapter and
+//! brings up the 2D desktop scanout. The VidPN cofunctional-modality DDIs are
+//! first-cut stubs (`dod.rs`); the full mode-commit + venus escape land in
+//! 7.1b / 7.2.
 
 #![no_std]
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
@@ -31,26 +34,18 @@ use wdk_alloc::WdkAllocator;
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod adapter;
+// TEMPORARY: registry-breadcrumb tracer to locate the post-start (Code 43)
+// failing DDI; removed once the DOD loads cleanly.
+mod diag;
+mod dod;
+mod dxgk;
 mod error;
-mod fence;
-// The WDF interrupt object (ISR/DPC + WdfInterruptCreate) is not used in
-// Phase 1–3 (the transport polls; device interrupts are suppressed). Kept for
-// Phase 4 (async fences); allow(dead_code) until then.
-#[allow(dead_code)]
-mod interrupt;
-mod ioctl;
-mod mapping;
-mod pnp;
-mod wdf;
 // The transport carries some not-yet-consumed scaffolding (blob/async-fence
-// helpers, extra VirtioError variants) until Phases 3–4 wire them in.
+// helpers used by the Phase-7.2 venus escape path) until that lands.
 #[allow(dead_code)]
 mod virtio;
 
-use wdk_sys::{
-    call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, WDFDRIVER,
-    WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
-};
+use dxgk::*;
 
 /// Emit a line to the kernel debugger / DebugView.
 pub(crate) fn kmsg(msg: &core::ffi::CStr) {
@@ -61,37 +56,96 @@ pub(crate) fn kmsg(msg: &core::ffi::CStr) {
     }
 }
 
-/// Driver entry point (named "DriverEntry" so the WDF loader finds it).
+/// Driver entry point (named "DriverEntry" so the loader finds it).
 ///
 /// # Safety
 /// Called by the OS with valid `driver_object` / `registry_path` per the WDM
-/// contract; KMDF takes over once `WdfDriverCreate` registers `evt_device_add`.
+/// contract; dxgkrnl takes over once `DxgkInitializeDisplayOnlyDriver` registers
+/// our DOD DDI table.
 #[export_name = "DriverEntry"]
 pub unsafe extern "system" fn driver_entry(
     driver_object: PDRIVER_OBJECT,
-    registry_path: PCUNICODE_STRING,
+    registry_path: PUNICODE_STRING,
 ) -> NTSTATUS {
-    kmsg(c"Helios: DriverEntry\n");
+    kmsg(c"Helios DOD: DriverEntry\n");
 
-    let mut config = wdf::driver_config(Some(pnp::evt_device_add));
-    config.EvtDriverUnload = Some(evt_driver_unload);
-
-    // SAFETY: `driver_object`/`registry_path` are the OS-provided pointers;
-    // `&mut config` is valid; we pass a null (optional) driver-handle out.
-    call_unsafe_wdf_function_binding!(
-        WdfDriverCreate,
-        driver_object,
-        registry_path,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &mut config,
-        WDF_NO_HANDLE.cast::<WDFDRIVER>()
-    )
+    let mut init = build_dod_init_data();
+    // SAFETY: pointers are valid for the call; `init` outlives the call on this
+    // stack frame, and DxgkInitializeDisplayOnlyDriver copies what it needs.
+    unsafe { DxgkInitializeDisplayOnlyDriver(driver_object, registry_path, &mut init) }
 }
 
-/// `EvtDriverUnload` — release the process-wide BAR MMIO mappings `WdkHal`
-/// cached across device start/stop cycles (nothing references them once all
-/// devices are removed, which precedes driver unload).
-unsafe extern "C" fn evt_driver_unload(_driver: WDFDRIVER) {
-    kmsg(c"Helios: DriverUnload\n");
-    crate::virtio::hal::WdkHal::unmap_all();
+/// Build the `KMDDOD_INITIALIZATION_DATA` DOD DDI table.
+///
+/// `Version = DXGKDDI_INTERFACE_VERSION` — the OS-native version (the bindgen
+/// header default; WDDM 3.2 on the 26100 WDK). This MUST match the version the
+/// structs are compiled against: dxgkrnl sizes the buffers it hands our DDIs
+/// (e.g. `DXGK_DRIVERCAPS` in QueryAdapterInfo) by the declared version, so
+/// declaring an older version (WIN8) against header-default-compiled structs
+/// makes the QueryAdapterInfo size check fail `BUFFER_TOO_SMALL` → Code 43. This
+/// matches the Microsoft KMDOD sample (`InitialData.Version =
+/// DXGKDDI_INTERFACE_VERSION`). Unfilled DDIs stay `None` (zeroed), which
+/// dxgkrnl tolerates for a display-only driver (KMDOD leaves many NULL too).
+fn build_dod_init_data() -> KMDDOD_INITIALIZATION_DATA {
+    // SAFETY: an all-zero KMDDOD_INITIALIZATION_DATA is valid and means "no DDI
+    // registered"; we then fill in the ones we support.
+    let mut data: KMDDOD_INITIALIZATION_DATA = unsafe { core::mem::zeroed() };
+    data.Version = DXGKDDI_INTERFACE_VERSION;
+
+    // ── Lifecycle / PnP / power ─────────────────────────────────────────────
+    data.DxgkDdiAddDevice = Some(dod::add_device);
+    data.DxgkDdiStartDevice = Some(dod::start_device);
+    data.DxgkDdiStopDevice = Some(dod::stop_device);
+    data.DxgkDdiRemoveDevice = Some(dod::remove_device);
+    data.DxgkDdiDispatchIoRequest = Some(dod::dispatch_io_request);
+    data.DxgkDdiInterruptRoutine = Some(dod::interrupt_routine);
+    data.DxgkDdiDpcRoutine = Some(dod::dpc_routine);
+    data.DxgkDdiQueryChildRelations = Some(dod::query_child_relations);
+    data.DxgkDdiQueryChildStatus = Some(dod::query_child_status);
+    data.DxgkDdiQueryDeviceDescriptor = Some(dod::query_device_descriptor);
+    data.DxgkDdiSetPowerState = Some(dod::set_power_state);
+    data.DxgkDdiUnload = Some(dod::unload);
+    data.DxgkDdiQueryInterface = Some(dod::query_interface);
+    data.DxgkDdiQueryAdapterInfo = Some(dod::query_adapter_info);
+    // Mandatory base-block DDIs — dxgkrnl rejects the init table (FAILED_DRIVER_ENTRY,
+    // Code 37) if ResetDevice / NotifyAcpiEvent / ControlEtwLogging are NULL.
+    data.DxgkDdiResetDevice = Some(dod::reset_device);
+    data.DxgkDdiNotifyAcpiEvent = Some(dod::notify_acpi_event);
+    data.DxgkDdiControlEtwLogging = Some(dod::control_etw_logging);
+    data.DxgkDdiSetPalette = Some(dod::set_palette);
+    data.DxgkDdiCollectDbgInfo = Some(dod::collect_dbg_info);
+    data.DxgkDdiGetScanLine = Some(dod::get_scan_line);
+    data.DxgkDdiControlInterrupt = Some(dod::control_interrupt);
+    data.DxgkDdiGetChildContainerId = Some(dod::get_child_container_id);
+    data.DxgkDdiNotifySurpriseRemoval = Some(dod::notify_surprise_removal);
+
+    // ── Pointer (software cursor — accept/ignore) ───────────────────────────
+    data.DxgkDdiSetPointerPosition = Some(dod::set_pointer_position);
+    data.DxgkDdiSetPointerShape = Some(dod::set_pointer_shape);
+
+    // ── VidPN (mode negotiation) ────────────────────────────────────────────
+    data.DxgkDdiIsSupportedVidPn = Some(dod::is_supported_vidpn);
+    data.DxgkDdiRecommendFunctionalVidPn = Some(dod::recommend_functional_vidpn);
+    data.DxgkDdiEnumVidPnCofuncModality = Some(dod::enum_vidpn_cofunc_modality);
+    data.DxgkDdiSetVidPnSourceVisibility = Some(dod::set_vidpn_source_visibility);
+    data.DxgkDdiCommitVidPn = Some(dod::commit_vidpn);
+    data.DxgkDdiUpdateActiveVidPnPresentPath = Some(dod::update_active_vidpn_present_path);
+    data.DxgkDdiRecommendMonitorModes = Some(dod::recommend_monitor_modes);
+    data.DxgkDdiQueryVidPnHWCapability = Some(dod::query_vidpn_hw_capability);
+
+    // ── Present + system display ────────────────────────────────────────────
+    data.DxgkDdiPresentDisplayOnly = Some(dod::present_display_only);
+    data.DxgkDdiStopDeviceAndReleasePostDisplayOwnership =
+        Some(dod::stop_device_and_release_post_display_ownership);
+    data.DxgkDdiSystemDisplayEnable = Some(dod::system_display_enable);
+    data.DxgkDdiSystemDisplayWrite = Some(dod::system_display_write);
+
+    // The venus carrier — STUB for now (NOT_SUPPORTED); the real escape dispatch
+    // (today's ioctl.rs body) lands in Phase 7.2.
+    data.DxgkDdiEscape = Some(dod::escape);
+
+    // The WDDM2.0+ power-runtime DDIs (SetPowerComponentFState /
+    // PowerRuntimeControlRequest / PowerRuntimeSetDeviceHandle) stay None — they
+    // are past the declared WIN8 version, so dxgkrnl does not validate them here.
+    data
 }
