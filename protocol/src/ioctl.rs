@@ -77,6 +77,10 @@ pub const IOCTL_HELIOS_MAP_BLOB: u32 =
 /// Wait on a fence id. In: [`crate::HeliosEscapeWaitFence`].
 pub const IOCTL_HELIOS_WAIT_FENCE: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 5, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+/// Throwaway Phase-7 gate op (DISPLAY.md §8): present a venus blob on scanout 0.
+/// In: [`crate::HeliosEscapePresentBlob`]. Removed once the DOD path lands.
+pub const IOCTL_HELIOS_PRESENT_BLOB: u32 =
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 6, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 
 // Lock the wire values (with Access bits 14-15 = 0b11 = read+write).
 const _: () = {
@@ -86,6 +90,7 @@ const _: () = {
     assert!(IOCTL_HELIOS_ALLOC_BLOB == 0x0022_E40C);
     assert!(IOCTL_HELIOS_MAP_BLOB == 0x0022_E410);
     assert!(IOCTL_HELIOS_WAIT_FENCE == 0x0022_E414);
+    assert!(IOCTL_HELIOS_PRESENT_BLOB == 0x0022_E418);
 };
 
 // ── Device interface GUID ───────────────────────────────────────────────────

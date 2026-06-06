@@ -32,6 +32,10 @@ pub const HELIOS_ESCAPE_CTX_DESTROY: u32 = 0x0003;
 pub const HELIOS_ESCAPE_ALLOC_BLOB: u32 = 0x0004;
 pub const HELIOS_ESCAPE_MAP_BLOB: u32 = 0x0005;
 pub const HELIOS_ESCAPE_WAIT_FENCE: u32 = 0x0006;
+/// Throwaway Phase-7 go/no-go gate op (DISPLAY.md §8) — present a venus blob
+/// resource on scanout 0 for zero-copy display. Not part of the steady-state
+/// protocol; removed once the DOD's `HELIOS_PRESENT_BLOB` escape supersedes it.
+pub const HELIOS_ESCAPE_PRESENT_BLOB: u32 = 0x0007;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -140,6 +144,25 @@ pub struct HeliosEscapeWaitFence {
     pub timeout_ns: u64,
 }
 
+/// `HELIOS_ESCAPE_PRESENT_BLOB` — throwaway Phase-7 gate op (DISPLAY.md §8). Bind
+/// a venus blob `resource_id` to scanout 0 (`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`)
+/// so the host displays it zero-copy under `-spice gl=on`. Input-only. 40 bytes.
+///
+/// `stride`/`offset` are plane-0 geometry (from `vkGetImageSubresourceLayout` on
+/// the LINEAR swapchain-like image) the host needs to interpret the exported
+/// dmabuf; the KMD forwards them as `SET_SCANOUT_BLOB.strides[0]/offsets[0]`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapePresentBlob {
+    pub hdr: HeliosEscapeHeader,
+    pub resource_id: u32, // in: the venus blob resource to scan out
+    pub width: u32,       // in: image width in pixels
+    pub height: u32,      // in: image height in pixels
+    pub format: u32,      // in: VIRTIO_GPU_FORMAT_*
+    pub stride: u32,      // in: plane-0 row pitch in bytes
+    pub offset: u32,      // in: plane-0 byte offset into the blob
+}
+
 const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
     assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 40);
@@ -147,4 +170,5 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 32);
+    assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
 };

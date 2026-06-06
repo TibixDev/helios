@@ -111,6 +111,11 @@ pub const VIRTIO_GPU_MAP_CACHE_WC: u32 = 0x03;
 
 pub const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
 
+// ── virtio_gpu_formats (scanout pixel formats) ──────────────────────────────
+/// BGRA8888, matching Vulkan `VK_FORMAT_B8G8R8A8_UNORM` — the format Helios
+/// scans out venus blobs with. (virtio_gpu_formats enum value 1.)
+pub const VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: u32 = 1;
+
 /// Control command header — prepended to every virtio-gpu command and response.
 /// 24 bytes, 8-byte aligned, no implicit padding.
 #[repr(C)]
@@ -239,6 +244,40 @@ pub struct VirtioGpuRespDisplayInfo {
     pub pmodes: [VirtioGpuDisplayOne; VIRTIO_GPU_MAX_SCANOUTS],
 }
 
+// ── Scanout / present (Phase 7 display engine) ──────────────────────────────
+
+/// `VIRTIO_GPU_CMD_SET_SCANOUT_BLOB` (0x010d) — bind a blob resource to a
+/// scanout for zero-copy display. The host materializes the blob's exported
+/// `dmabuf_fd` (set at blob-create via `virgl_renderer_resource_get_info`) and
+/// presents it via the GL backend under `-spice gl=on`. 96 bytes. Field order
+/// pinned to `virtio_gpu_set_scanout_blob`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuSetScanoutBlob {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub r: VirtioGpuRect,  // target rect on the scanout
+    pub scanout_id: u32,
+    pub resource_id: u32,  // a blob resource (0 disables this scanout)
+    pub width: u32,        // blob image width in pixels
+    pub height: u32,       // blob image height in pixels
+    pub format: u32,       // VIRTIO_GPU_FORMAT_*
+    pub padding: u32,
+    pub strides: [u32; 4], // per-plane row stride in bytes
+    pub offsets: [u32; 4], // per-plane byte offset into the blob
+}
+
+/// `VIRTIO_GPU_CMD_RESOURCE_FLUSH` (0x0104) — flush a resource's dirty rect to
+/// the display. For a GL/blob scanout this is what drives the host present.
+/// 48 bytes. Pinned to `virtio_gpu_resource_flush`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuResourceFlush {
+    pub hdr: VirtioGpuCtrlHdr,
+    pub r: VirtioGpuRect,
+    pub resource_id: u32,
+    pub padding: u32,
+}
+
 // Compile-time guarantees that the on-wire sizes are what the host expects.
 const _: () = {
     assert!(core::mem::size_of::<VirtioGpuCtrlHdr>() == 24);
@@ -248,6 +287,8 @@ const _: () = {
     assert!(core::mem::size_of::<VirtioGpuResourceMapBlob>() == 40);
     assert!(core::mem::size_of::<VirtioGpuRespMapInfo>() == 32);
     assert!(core::mem::size_of::<VirtioGpuRespDisplayInfo>() == 24 + 16 * 24);
+    assert!(core::mem::size_of::<VirtioGpuSetScanoutBlob>() == 96);
+    assert!(core::mem::size_of::<VirtioGpuResourceFlush>() == 48);
 };
 
 /// Pin every wire constant above to the `virtio-bindings` crate (generated from
@@ -323,6 +364,10 @@ mod virtio_bindings_pin {
         pin!(VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
         pin!(VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE);
         pin!(VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE, VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE);
+        pin!(
+            VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+            virtio_gpu_formats_VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+        );
     }
 
     /// Cross-check the size AND alignment of every on-wire struct against the
@@ -359,5 +404,7 @@ mod virtio_bindings_pin {
         pin_layout!(VirtioGpuResourceMapBlob, vb::virtio_gpu_resource_map_blob);
         pin_layout!(VirtioGpuResourceUnmapBlob, vb::virtio_gpu_resource_unmap_blob);
         pin_layout!(VirtioGpuRespMapInfo, vb::virtio_gpu_resp_map_info);
+        pin_layout!(VirtioGpuSetScanoutBlob, vb::virtio_gpu_set_scanout_blob);
+        pin_layout!(VirtioGpuResourceFlush, vb::virtio_gpu_resource_flush);
     }
 }
