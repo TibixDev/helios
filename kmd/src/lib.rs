@@ -40,6 +40,7 @@ mod diag;
 mod dod;
 mod dxgk;
 mod error;
+mod vidpn;
 // The transport carries some not-yet-consumed scaffolding (blob/async-fence
 // helpers used by the Phase-7.2 venus escape path) until that lands.
 #[allow(dead_code)]

@@ -337,12 +337,7 @@ pub unsafe extern "C" fn is_supported_vidpn(
     p_is_supported_vidpn: *mut DXGKARG_ISSUPPORTEDVIDPN,
 ) -> NTSTATUS {
     crate::diag::record(0x0700_0000);
-    if p_is_supported_vidpn.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    // SAFETY: valid INOUT struct per the DDI contract.
-    unsafe { (*p_is_supported_vidpn).IsVidPnSupported = 1 };
-    STATUS_SUCCESS
+    unsafe { crate::vidpn::is_supported_vidpn(p_is_supported_vidpn) }
 }
 
 /// `DxgkDdiRecommendFunctionalVidPn` — we recommend none (dxgkrnl builds one).
@@ -357,11 +352,14 @@ pub unsafe extern "C" fn recommend_functional_vidpn(
 /// `DxgkDdiEnumVidPnCofuncModality`.
 // STUB (7.1b): walk the topology and pin/assign the source+target mode sets.
 pub unsafe extern "C" fn enum_vidpn_cofunc_modality(
-    _h_adapter: *mut c_void,
-    _p_enum_cofunc_modality: *const _DXGKARG_ENUMVIDPNCOFUNCMODALITY,
+    h_adapter: *mut c_void,
+    p_enum_cofunc_modality: *const _DXGKARG_ENUMVIDPNCOFUNCMODALITY,
 ) -> NTSTATUS {
     crate::diag::record(0x0800_0000);
-    STATUS_SUCCESS
+    let Some(adapter) = (unsafe { adapter(h_adapter) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    unsafe { crate::vidpn::enum_vidpn_cofunc_modality(adapter, p_enum_cofunc_modality) }
 }
 
 /// `DxgkDdiSetVidPnSourceVisibility` — track visibility; blackout handled at the
@@ -378,11 +376,14 @@ pub unsafe extern "C" fn set_vidpn_source_visibility(
 // STUB (7.1b): read the pinned source mode and (re)program the scanout via
 // set_desktop_mode at the committed resolution.
 pub unsafe extern "C" fn commit_vidpn(
-    _h_adapter: *mut c_void,
-    _p_commit_vidpn: *const _DXGKARG_COMMITVIDPN,
+    h_adapter: *mut c_void,
+    p_commit_vidpn: *const _DXGKARG_COMMITVIDPN,
 ) -> NTSTATUS {
     crate::diag::record(0x0900_0000);
-    STATUS_SUCCESS
+    let Some(adapter) = (unsafe { adapter(h_adapter) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    unsafe { crate::vidpn::commit_vidpn(adapter, p_commit_vidpn) }
 }
 
 /// `DxgkDdiUpdateActiveVidPnPresentPath`.
@@ -398,10 +399,10 @@ pub unsafe extern "C" fn update_active_vidpn_present_path(
 // STUB (7.1b): add the supported monitor modes (current = preferred).
 pub unsafe extern "C" fn recommend_monitor_modes(
     _h_adapter: *mut c_void,
-    _p_recommend_monitor_modes: *const _DXGKARG_RECOMMENDMONITORMODES,
+    p_recommend_monitor_modes: *const _DXGKARG_RECOMMENDMONITORMODES,
 ) -> NTSTATUS {
     crate::diag::record(0x0A00_0000);
-    STATUS_SUCCESS
+    unsafe { crate::vidpn::recommend_monitor_modes(p_recommend_monitor_modes) }
 }
 
 /// `DxgkDdiQueryVidPnHWCapability` — no HW transform offloads; zeroed caps
@@ -421,21 +422,49 @@ pub unsafe extern "C" fn query_vidpn_hw_capability(
 /// first light) then pushes it to the host (`TRANSFER_TO_HOST_2D` +
 /// `RESOURCE_FLUSH`). Runs at PASSIVE/APC; the source is valid for this call only.
 pub unsafe extern "C" fn present_display_only(
-    _h_adapter: *mut c_void,
+    h_adapter: *mut c_void,
     p_present_display_only: *const DXGKARG_PRESENT_DISPLAYONLY,
 ) -> NTSTATUS {
     if p_present_display_only.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    // STUB (7.1b): paint the source into the desktop framebuffer and push it
-    // (`present_desktop` → blt + TRANSFER_TO_HOST_2D + RESOURCE_FLUSH). Deferred
-    // until the real CommitVidPn (below) pins the source mode to our scanout
-    // geometry — only then is the source surface's size (Pitch × committed
-    // height) known to match, so the per-row blt cannot over-read `pSource`. For
-    // the 7.1a load gate we accept-and-drop the frame (no memory access), which
-    // cannot bugcheck. `present_desktop`/`set_desktop_mode` in gpu.rs are the
-    // wired-up path this enables.
-    STATUS_SUCCESS
+    crate::diag::record(0x0D00_0000);
+    // SAFETY: valid per the DDI contract; read-only.
+    let arg = unsafe { &*p_present_display_only };
+    if arg.BytesPerPixel < 4 || arg.pSource.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(adapter) = (unsafe { adapter(h_adapter) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    // Top-down source only (Pitch > 0) for first light.
+    let pitch = arg.Pitch;
+    if pitch <= 0 {
+        return STATUS_SUCCESS;
+    }
+    let src_pitch = pitch as usize;
+    // The committed scanout geometry (CommitVidPn → set_desktop_mode); (0,0) if
+    // no mode is committed yet → drop the frame. `desktop_dims` height bounds the
+    // source read: CommitVidPn pinned the source mode to this height, so the
+    // present source surface is `Pitch * height` bytes — the slice cannot
+    // over-read.
+    let (_w, h) = adapter.with_virtio(|v| v.desktop_dims()).unwrap_or((0, 0));
+    if h == 0 {
+        return STATUS_SUCCESS;
+    }
+    let src_len = src_pitch.saturating_mul(h as usize);
+    // SAFETY: dxgkrnl guarantees `pSource` is a locked non-paged surface of at
+    // least `Pitch * Height` bytes for this call; `present_desktop` clamps each
+    // row copy to `src.len()`.
+    let src = unsafe { core::slice::from_raw_parts(arg.pSource as *const u8, src_len) };
+
+    let mut retired: Vec<crate::virtio::gpu::InFlight> = Vec::new();
+    let r = adapter.with_virtio(|v| v.present_desktop(src, src_pitch, &mut retired));
+    drop(retired);
+    match r {
+        Ok(Ok(())) => STATUS_SUCCESS,
+        Ok(Err(_)) | Err(_) => STATUS_SUCCESS, // soft-fail a present; never bugcheck
+    }
 }
 
 // ── Pointer (software cursor — accept-and-ignore) ───────────────────────────
@@ -573,7 +602,7 @@ pub unsafe extern "C" fn escape(
 /// contiguous framebuffer at PASSIVE_LEVEL (outside the virtio spinlock), installs
 /// it under the lock via [`VirtioGpu::set_desktop_mode`], and drops the old
 /// framebuffer (if any) back at PASSIVE. Returns the command result.
-fn set_desktop_mode(adapter: &AdapterContext, width: u32, height: u32) -> Result<(), crate::error::DriverError> {
+pub(crate) fn set_desktop_mode(adapter: &AdapterContext, width: u32, height: u32) -> Result<(), crate::error::DriverError> {
     let bytes = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(BYTES_PER_PIXEL as usize);
