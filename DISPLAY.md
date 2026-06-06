@@ -292,6 +292,14 @@ Only after this gate passes do you flip the driver model to a DOD (§3) and wire
 - **7.1 — DOD skeleton:** flip INF System→Display, `DxgkInitializeDisplayOnlyDriver`, the DOD DDI surface
   (recover the shape from `658168f`), `DxgkDdiStartDevice` maps BARs + inits the *reused* virtio transport,
   `DxgkConfigAccess`. Gate: device loads as a Display adapter (Code 0), desktop appears on spice (2D path).
+  **STATUS (2026-06-06):** the canonical reference is the **Microsoft KMDOD sample**
+  (`Windows-driver-samples/video/KMDOD`), not VioGpuDod. **7.1a DONE** — loads as Display adapter, Code 0
+  (commit `b3eb40f`; `Version=DXGKDDI_INTERFACE_VERSION` native, `displib.lib` stays, `DxgkDdiResetDevice`
+  mandatory). **7.1b IN PROGRESS** — real VidPN + present (KMDOD-ported, `ca8af7f`); the Helios monitor
+  enumerates, but `CommitVidPn`/`PresentDisplayOnly` don't fire yet (an `EnumVidPnCofuncModality`
+  cofunctional-VidPN bug). See `PHASE7_DISPLAY_HANDOVER.md` §0 + the `dod-7-1a-loads` memory. Host viewer note:
+  `gtk,gl=on` fails `eglMakeCurrent` on this multi-GPU host; the 2D desktop needs no GL — use
+  `tools/launch-helios-gtk.sh` with `$HELIOS_DISPLAY` = `gtk` (software) or `spice`.
 - **7.2 — Venus over `DxgkDdiEscape`:** port the escape dispatch body back; switch the Mesa
   `vn_renderer_helios` transport to `D3DKMTEscape`. Gate: `vulkaninfo`/`helios_vk_exec` pass through the DOD
   (the Phase-5 gate, now over escape) — `vkQueueWaitIdle => 0`, `vkCmdFillBuffer` round-trip `0xDEADBEEF`.

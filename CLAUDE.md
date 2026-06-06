@@ -162,12 +162,13 @@ fullscreen venus content **zero-copy** via `SET_SCANOUT_BLOB` under `-spice gl=o
 System-class KMDF → WDDM Display-Only Driver; venus carrier flips IOCTL → `DxgkDdiEscape`.** (Replaces the
 abandoned Phase-6 software-WSI present.)
 
-- [ ] **7.0 Go/no-go gate (do FIRST):** spice/gtk `gl=on` + a throwaway `SET_SCANOUT_BLOB` of a venus blob on
-      the *current* driver — confirm a venus frame displays zero-copy (`res->base.dmabuf_fd >= 0`). De-risks the
-      one load-bearing unknown (does the venus swapchain image export a real dmabuf — ANV should).
-- [ ] **7.1 DOD skeleton:** INF Class System→Display, `DxgkInitializeDisplayOnlyDriver`, DOD DDIs +
-      `DxgkDdiPresentDisplayOnly` (ref VioGpuDod/qxldod), `DxgkConfigAccess`, BAR map in `DxgkDdiStartDevice`.
-      Recover the shapes from git `658168f`. Desktop appears on spice.
+- [x] **7.0 Go/no-go gate:** GO — venus blob exports a real `DRM_FORMAT_MODIFIER(LINEAR)` dma-buf, host accepts
+      `SET_SCANOUT_BLOB` (`dmabuf_fd>=0`). (On-screen pixels deferred to 7.1's gate; host display-backend bugs.)
+- [~] **7.1 DOD skeleton:** **7.1a DONE** — loads as a Display adapter, Code 0 (commit `b3eb40f`); the
+      canonical reference is the **Microsoft KMDOD sample** (`Windows-driver-samples/video/KMDOD`).
+      **7.1b IN PROGRESS** — real VidPN + present ported from KMDOD (`ca8af7f`); the monitor enumerates but
+      `CommitVidPn`/`Present` don't fire (an `EnumVidPnCofuncModality` bug). See `PHASE7_DISPLAY_HANDOVER.md` §0
+      + the `dod-7-1a-loads` memory. (`gtk,gl=on` fails `eglMakeCurrent` on this host; 2D needs no GL.)
 - [ ] **7.2 Venus over `DxgkDdiEscape`:** port the escape dispatch (body = today's `ioctl.rs`); switch the Mesa
       `vn_renderer_helios` transport to `D3DKMTOpenAdapterFromLuid` + `D3DKMTEscape`.
 - [ ] **7.3 Fullscreen present:** `HELIOS_PRESENT_BLOB` escape op + scanout-0 arbiter (desktop ⇄ venus blob),

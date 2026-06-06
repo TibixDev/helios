@@ -9,25 +9,61 @@ the WDDM **render** miniport (confirmed dead end: needs a multi-man-year native 
 
 ---
 
-## 0. Prompt for the next agent
+## 0. Prompt for the next agent  (updated 2026-06-06 — read the `dod-7-1a-loads` memory first)
 
-Continue Helios. The project pivots its DISPLAY path to a **WDDM Display-Only Driver (DOD)** that owns the
-virtio-gpu scanout 0 **and** carries the venus ops over `DxgkDdiEscape`, so venus-rendered content reaches the
-host **directly** via `VIRTIO_GPU_CMD_SET_SCANOUT_BLOB` (zero-copy dmabuf) displayed under **`-spice gl=on`** —
-instead of the dead software-blit WSI path. The venus rendering stack (Mesa venus ICD, virtio transport, blob
-mapping) is **reused**; the driver MODEL flips System-class KMDF → DOD, and the venus carrier flips IOCTL →
-`D3DKMTEscape` (byte layouts unchanged; both shapes exist in git `658168f`). **The win = fullscreen vkcube /
-DXVK / VKD3D displayed fast and zero-copy; plus a real Windows desktop on SPICE (DOD 2D path, GL-displayed).**
+Continue Helios Phase 7. The DISPLAY pivot to a **WDDM Display-Only Driver (DOD)** is **largely built and
+loading**; the remaining work is one focused VidPN bug + the venus-over-escape carrier. Status:
 
-**DO STEP 1 FIRST — the go/no-go gate.** Before any DOD rewrite, prove a venus-rendered blob can be
-`SET_SCANOUT_BLOB`'d and displayed zero-copy under gl=on, on the *current* System-class driver (it already owns
-the FDO). This de-risks the single load-bearing unknown (does the venus swapchain image export a real
-`dmabuf_fd` — Intel ANV should, but it's unverified). See §2.
+- **Phase 7.0 gate — DONE/GO** (committed): a venus blob exports a real `DRM_FORMAT_MODIFIER(LINEAR)` dma-buf
+  and the host accepts `SET_SCANOUT_BLOB` (`dmabuf_fd>=0`). On-screen pixels were never visually confirmed (host
+  display-backend bugs, not Helios). The Mesa modifier-gate fix + the scanout/protocol/KMD spine are committed.
+- **Phase 7.1a — DONE** (commit `b3eb40f`): the driver-model flip System-class KMDF → **WDDM Display-Only
+  Driver** works — Helios binds `PCI\VEN_1AF4&DEV_1050` as **Class=Display, device Code 0** on win11 24H2, no
+  BSOD. `DriverEntry`→`DxgkInitializeDisplayOnlyDriver` + the full `KMDDOD_INITIALIZATION_DATA` table;
+  `DxgkConfigAccess`; reused virtio transport in `DxgkDdiStartDevice`; DOD-scoped dispmprt/d3dkmddi bindgen back
+  in `build.rs` (+ `displib.lib`); INF=Display-class. Modeled on the **Microsoft KMDOD sample**
+  (`github.com/microsoft/Windows-driver-samples/video/KMDOD` — the canonical DOD reference; `bdd_ddi.cxx`,
+  `bdd.cxx`, `bdd_dmm.cxx`). Key gotchas (each cost a reboot): `Version = DXGKDDI_INTERFACE_VERSION` (native, NOT
+  WIN8 — else QueryAdapterInfo DRIVERCAPS buffer-size check fails → Code 43); `DxgkDdiResetDevice` mandatory
+  (else Code 37); `displib.lib` stays (exports `DxgkInitializeDisplayOnlyDriver`).
+- **Phase 7.1b — IN PROGRESS** (commits `ca8af7f`, `5ec3ef6`, `c570de4`): real VidPN mode-management ported
+  from KMDOD `bdd_dmm.cxx` into `kmd/src/vidpn.rs`, `DxgkDdiPresentDisplayOnly` un-stubbed. Helios's **monitor
+  now enumerates** (a "Generic Monitor" appears on the adapter) — dxgkrnl builds a functional VidPN, runs
+  `EnumVidPnCofuncModality` clean, no BSOD. **BLOCKER:** even with Helios as the SOLE/PRIMARY display (standalone
+  VM), **CommitVidPn (breadcrumb 0x09) and PresentDisplayOnly (0x0D) never fire** — `HeliosStep` stays `0x08`
+  (EnumVidPnCofuncModality); the standalone sits at LogonUI with no present. So `EnumVidPnCofuncModality` yields
+  a cofunctional VidPN dxgkrnl won't commit.
 
-Build/run via the `win` MCP (`win_cargo`/`win_meson`/`win_exec`). GUI apps need the interactive console
-(`schtasks /it`, not session-0 SSH). The user must visually confirm the spice display; you check host logs +
-the process staying alive. After repeated venus crashes, `devcon restart "PCI\VEN_1AF4&DEV_1050"` to clear
-leaked host contexts.
+**DO THIS FIRST — find why no commit.** Build+sign on the **libvirt** win11 (signing fails on the standalone:
+no user crypto profile at LogonUI), install, reboot, then read `HKLM\SYSTEM\CurrentControlSet\Services\
+helios_kmd\HeliosMask` (sticky OR of every DDI bit) + `HeliosStep` (= `0x0800_00<flags><paths>` from
+EnumVidPnCofuncModality: paths in bits[0..8], src-modeset-assigned `0x100`, tgt-modeset-assigned `0x200`). To
+make dxgkrnl actually attempt a commit on the (secondary) libvirt Helios, extend the desktop onto it
+(`SetDisplayConfig` CCD / display settings). Interpret: `paths==0` ⇒ empty constraining topology (upstream);
+assigns==0 ⇒ create/assign failed; assigns set but no commit ⇒ **mode-set CONTENT malformed** — compare
+`add_single_source_mode`/`add_single_target_mode` field-by-field vs KMDOD `bdd_dmm.cxx` (suspects: target
+`VideoSignalInfo` PixelRate / the preference union; source PrimSurfSize/VisibleRegionSize/Stride). Then expand
+`MODE_TABLE` (currently one 1024x768).
+
+**Viewing (the host display backend, independent of the commit bug):** `gtk,gl=on` is dead on this multi-GPU
+Wayland host (repeating `eglMakeCurrent failed` — qemu/host EGL, not Helios). The 2D DOD desktop needs no GL.
+`tools/launch-helios-gtk.sh` (standalone qemu, **virtio-gpu = sole/primary display**) now selects the backend
+via `$HELIOS_DISPLAY`: default `gtk` (software), or `spice` (`-spice :5930`; view `remote-viewer
+spice://127.0.0.1:5930` — no QXL in the standalone so spice binds the virtio-gpu console, sidestepping the EGL
+issue). `HELIOS_SPICE_GL=on` only for the venus dmabuf path (7.3). Requires `sudo` (the owner runs it) and the
+libvirt VM shut off first; restart libvirt after.
+
+**Then Phase 7.2** — venus over `DxgkDdiEscape`: the DOD's `DxgkDdiEscape` is a NOT_SUPPORTED stub; port the
+body from the deleted System-class `kmd/src/ioctl.rs` (recover via git), and re-wire the Mesa
+`vn_renderer_helios` transport from `DeviceIoControl` → `D3DKMTOpenAdapterFromLuid` + `D3DKMTEscape`. The async
+submit + the 6 op byte layouts are unchanged. Then 7.3 fullscreen venus via `HELIOS_PRESENT_BLOB` + the
+scanout-0 arbiter (the gpu.rs `set_scanout_blob`/`resource_flush` + the venus `present_desktop` plumbing exist).
+
+**Build/test discipline:** `win` MCP (`win_cargo`/`win_meson`/`win_exec`); the driver is a same-named service
+so a **reboot** is needed after each `devcon update` (live-swap → Code 14). `kmd/src/diag.rs` is the TEMPORARY
+breadcrumb tracer (remove once committing cleanly). `.dod-vidpn-types.md` (untracked) holds the exact bindgen
+VidPN types. Owner runs the standalone (`sudo`) + does the visual confirm; Claude can't sudo and can't see the
+screen.
 
 ---
 
@@ -91,7 +127,9 @@ leaked host contexts.
 
 Per `DISPLAY.md` §3–§5 and §9. In order:
 
-- **7.1 DOD skeleton.** INF Class System→**Display** {4d36e968-…}; `DriverEntry` →
+- **7.1 DOD skeleton. [7.1a DONE — loads as Display adapter, Code 0 (b3eb40f). 7.1b IN PROGRESS — VidPN +
+  present built (ca8af7f), monitor enumerates, but CommitVidPn/Present don't fire; see §0 for the open
+  EnumVidPnCofuncModality bug + the spice/gtk viewer notes.]** INF Class System→**Display** {4d36e968-…}; `DriverEntry` →
   `DxgkInitializeDisplayOnlyDriver` + `DXGKDDI_DISPLAY_ONLY_FUNCTIONS`; `DxgkDdiStartDevice` maps BARs + inits
   the **reused** virtio transport; `DxgkConfigAccess` (revert from `BUS_INTERFACE_STANDARD`). Implement
   `DxgkDdiPresentDisplayOnly` + the VidPN/pointer DDIs (reference **VioGpuDod** + **qxldod**). **Recover the
