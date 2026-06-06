@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# tools/launch-helios-gtk.sh — standalone QEMU for win11, -display gtk,gl=on (venus),
-# native Wayland, as the desktop user. Pure virtio-gpu-gl-pci (no VGA/QXL) = clean GL
-# console. virtiofs shares the repo as Z:\ so builds work in-VM.
+# tools/launch-helios-gtk.sh — standalone QEMU for win11, native Wayland, as the
+# desktop user. Pure virtio-gpu-gl-pci (no VGA/QXL) so the Helios DOD is the SOLE
+# (primary) display. virtiofs shares the repo as Z:\ so builds work in-VM.
 #   sudo bash tools/launch-helios-gtk.sh        # libvirt win11 must be shut off first
+#
+# Display backend: $HELIOS_DISPLAY (default "gtk" = software, NO GL). The 2D DOD
+# desktop scanout displays fine without GL. `gl=on` is only needed for the venus
+# zero-copy dmabuf path (Phase 7.3) and currently fails on this multi-GPU Wayland
+# host with repeating `Gdk-WARNING eglMakeCurrent failed` (a qemu-gtk/host EGL
+# issue, not Helios). For the venus path use: HELIOS_DISPLAY=gtk,gl=on sudo -E ...
 set -uo pipefail
 USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
@@ -17,7 +23,8 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
   ip link del heltap0 2>/dev/null||true; ip tuntap add dev heltap0 mode tap user "$USER_NAME"
   ip link set heltap0 master virbr0 && ip link set heltap0 up
   sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
-    WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=wayland bash "$0"
+    WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=wayland \
+    HELIOS_DISPLAY="${HELIOS_DISPLAY:-gtk}" bash "$0"
   exit $?
 fi
 # ---- user phase (desktop user, native Wayland) ----
@@ -149,4 +156,4 @@ exec /usr/bin/qemu-system-x86_64 \
   -msg \
   timestamp=on \
   -display \
-  gtk,gl=on
+  "${HELIOS_DISPLAY:-gtk}"

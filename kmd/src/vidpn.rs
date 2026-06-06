@@ -178,9 +178,17 @@ pub unsafe fn enum_vidpn_cofunc_modality(
         return STATUS_INVALID_PARAMETER;
     };
 
+    // Diagnostics: count paths iterated + whether we assigned a source/target
+    // mode set, reported at the end via HeliosStep low bits
+    // (0x0800_00<flags><paths>): paths in bits[0..8], src-assigned=0x100,
+    // tgt-assigned=0x200. If paths==0 the constraining topology was empty (bug
+    // upstream); if assigns are 0 the mode-set create/assign failed.
+    let mut paths: u32 = 0;
+    let mut diag_flags: u32 = 0;
     let mut p_path: *const _D3DKMDT_VIDPN_PRESENT_PATH = core::ptr::null();
     let mut st = unsafe { first(h_topo, &mut p_path) };
     while ok(st) && st != STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET && !p_path.is_null() {
+        paths = paths.saturating_add(1);
         let path = unsafe { &*p_path };
         let source_id = path.VidPnSourceId;
         let target_id = path.VidPnTargetId;
@@ -215,7 +223,9 @@ pub unsafe fn enum_vidpn_cofunc_modality(
                             && !p_new.is_null()
                         {
                             unsafe { add_single_source_mode(&*p_new, h_new) };
-                            unsafe { assign(h_vidpn, source_id, h_new) };
+                            if ok(unsafe { assign(h_vidpn, source_id, h_new) }) {
+                                diag_flags |= 0x100;
+                            }
                         }
                     } else {
                         if let Some(rel) = set_iface.pfnReleaseModeInfo {
@@ -256,7 +266,9 @@ pub unsafe fn enum_vidpn_cofunc_modality(
                             && !p_new.is_null()
                         {
                             unsafe { add_single_target_mode(&*p_new, h_new) };
-                            unsafe { assign(h_vidpn, target_id, h_new) };
+                            if ok(unsafe { assign(h_vidpn, target_id, h_new) }) {
+                                diag_flags |= 0x200;
+                            }
                         }
                     } else {
                         if let Some(rel) = set_iface.pfnReleaseModeInfo {
@@ -298,6 +310,8 @@ pub unsafe fn enum_vidpn_cofunc_modality(
         unsafe { release_path(h_topo, p_path) };
         p_path = p_next;
     }
+    // Report what the enumeration did (see the `paths`/`diag_flags` note above).
+    crate::diag::record(0x0800_0000 | (paths & 0xFF) | diag_flags);
     STATUS_SUCCESS
 }
 
