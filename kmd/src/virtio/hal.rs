@@ -69,18 +69,6 @@ impl DmaBuffer {
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
-    /// Guest-physical base of the (contiguous) buffer — the `addr` for a
-    /// virtio-gpu `RESOURCE_ATTACH_BACKING` mem-entry. Contiguous, so one entry
-    /// spans the whole buffer.
-    pub fn phys(&self) -> u64 {
-        self.pa as u64
-    }
-
-    /// Requested byte length.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
     /// The buffer as a mutable byte slice of its requested length.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as above; `&mut self` guarantees exclusive access.

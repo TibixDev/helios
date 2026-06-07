@@ -17,7 +17,7 @@ pub mod config;
 pub mod gpu;
 pub mod hal;
 
-pub use config::DxgkConfigAccess;
+pub use config::KmdfConfigAccess;
 pub use gpu::VirtioGpu;
 
 use wdk_sys::{

@@ -278,76 +278,6 @@ pub struct VirtioGpuResourceFlush {
     pub padding: u32,
 }
 
-// ── 2D scanout helpers ──────────────────────────────────────────────────────
-// The non-blob 2D path: a guest-page-backed scanout resource. Kept for display
-// experiments and diagnostics; distinct from the zero-copy venus blob path.
-
-/// BGRX8888 — matches the Windows desktop primary `D3DDDIFMT_X8R8G8B8` byte
-/// order in memory (B,G,R,X little-endian). (virtio_gpu_formats enum value 2.)
-/// The X (unused alpha) byte keeps the host from blending the desktop as
-/// translucent. (`VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM = 1` above is the venus blob.)
-pub const VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: u32 = 2;
-
-/// `VIRTIO_GPU_CMD_RESOURCE_CREATE_2D` (0x0101) — create a host-side 2D resource
-/// (a guest-page-backed scanout-capable image). 32 bytes. Pinned to
-/// `virtio_gpu_resource_create_2d`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct VirtioGpuResourceCreate2d {
-    pub hdr: VirtioGpuCtrlHdr,
-    pub resource_id: u32,
-    pub format: u32, // VIRTIO_GPU_FORMAT_* (B8G8R8X8_UNORM for the desktop)
-    pub width: u32,
-    pub height: u32,
-}
-
-/// `VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING` (0x0106) header — followed on the
-/// wire by `nr_entries` × [`VirtioGpuMemEntry`]. 32 bytes. Pinned to
-/// `virtio_gpu_resource_attach_backing`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct VirtioGpuResourceAttachBacking {
-    pub hdr: VirtioGpuCtrlHdr,
-    pub resource_id: u32,
-    pub nr_entries: u32,
-}
-
-/// One guest-memory backing entry following an ATTACH_BACKING header — a
-/// physically-contiguous run of guest pages. 16 bytes. Pinned to
-/// `virtio_gpu_mem_entry`. `addr` is a **guest-physical** address.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct VirtioGpuMemEntry {
-    pub addr: u64, // guest-physical base of this run
-    pub length: u32, // run length in bytes
-    pub padding: u32,
-}
-
-/// `VIRTIO_GPU_CMD_SET_SCANOUT` (0x0103) — bind a 2D resource to a scanout. (The
-/// blob variant [`VirtioGpuSetScanoutBlob`] is the venus path; this is the
-/// non-blob desktop path.) 48 bytes. Pinned to `virtio_gpu_set_scanout`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct VirtioGpuSetScanout {
-    pub hdr: VirtioGpuCtrlHdr,
-    pub r: VirtioGpuRect, // visible rect on the scanout
-    pub scanout_id: u32,
-    pub resource_id: u32, // a 2D resource (0 disables this scanout)
-}
-
-/// `VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D` (0x0105) — copy the resource's guest
-/// backing into the host's copy of the resource for the given rect. 56 bytes.
-/// Pinned to `virtio_gpu_transfer_to_host_2d`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct VirtioGpuTransferToHost2d {
-    pub hdr: VirtioGpuCtrlHdr,
-    pub r: VirtioGpuRect, // dirty rect to transfer
-    pub offset: u64, // byte offset into the backing for r.{x,y}
-    pub resource_id: u32,
-    pub padding: u32,
-}
-
 // Compile-time guarantees that the on-wire sizes are what the host expects.
 const _: () = {
     assert!(core::mem::size_of::<VirtioGpuCtrlHdr>() == 24);
@@ -359,11 +289,6 @@ const _: () = {
     assert!(core::mem::size_of::<VirtioGpuRespDisplayInfo>() == 24 + 16 * 24);
     assert!(core::mem::size_of::<VirtioGpuSetScanoutBlob>() == 96);
     assert!(core::mem::size_of::<VirtioGpuResourceFlush>() == 48);
-    assert!(core::mem::size_of::<VirtioGpuResourceCreate2d>() == 40);
-    assert!(core::mem::size_of::<VirtioGpuResourceAttachBacking>() == 32);
-    assert!(core::mem::size_of::<VirtioGpuMemEntry>() == 16);
-    assert!(core::mem::size_of::<VirtioGpuSetScanout>() == 48);
-    assert!(core::mem::size_of::<VirtioGpuTransferToHost2d>() == 56);
 };
 
 /// Pin every wire constant above to the `virtio-bindings` crate (generated from
@@ -443,10 +368,6 @@ mod virtio_bindings_pin {
             VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
             virtio_gpu_formats_VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
         );
-        pin!(
-            VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
-            virtio_gpu_formats_VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
-        );
     }
 
     /// Cross-check the size AND alignment of every on-wire struct against the
@@ -485,10 +406,5 @@ mod virtio_bindings_pin {
         pin_layout!(VirtioGpuRespMapInfo, vb::virtio_gpu_resp_map_info);
         pin_layout!(VirtioGpuSetScanoutBlob, vb::virtio_gpu_set_scanout_blob);
         pin_layout!(VirtioGpuResourceFlush, vb::virtio_gpu_resource_flush);
-        pin_layout!(VirtioGpuResourceCreate2d, vb::virtio_gpu_resource_create_2d);
-        pin_layout!(VirtioGpuResourceAttachBacking, vb::virtio_gpu_resource_attach_backing);
-        pin_layout!(VirtioGpuMemEntry, vb::virtio_gpu_mem_entry);
-        pin_layout!(VirtioGpuSetScanout, vb::virtio_gpu_set_scanout);
-        pin_layout!(VirtioGpuTransferToHost2d, vb::virtio_gpu_transfer_to_host_2d);
     }
 }

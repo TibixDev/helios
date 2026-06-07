@@ -1,86 +1,161 @@
 //! Adapter context — one per virtio-gpu device the driver binds to.
 //!
-//! Allocated in `DxgkDdiAddDevice`, populated in `DxgkDdiStartDevice`, freed in
-//! `DxgkDdiRemoveDevice`. Dxgkrnl hands this back to us as the opaque
-//! `MiniportDeviceContext` in every subsequent DDI call.
-//!
-//! Phase-7 display pivot (DISPLAY.md §3): recovered from git
-//! `658168f:kmd/src/adapter.rs` (the WDDM adapter shape) — it replaces the
-//! System-class KMDF device-context-on-the-WDFDEVICE model. The 2D scanout /
-//! present state lives inside [`VirtioGpu`] (gpu.rs), reached under the same
-//! `virtio_lock`, so this context stays focused on the transport + the saved
-//! Dxgkrnl callback interface.
+//! Under the System-class KMDF model the per-device state hangs off the WDF
+//! device object. WDF stores a small POD [`DeviceContext`] *inline* in the
+//! device object (the typed-context mechanism); that context holds a raw pointer
+//! to a heap-`Box`ed [`AdapterContext`] which carries the real state (the virtio
+//! transport behind a spinlock, and the fence table). Using a `Box` keeps Rust
+//! construction/`Drop` ordinary — WDF would otherwise hand us a zeroed blob that
+//! is unsound to interpret as a `Option<VirtioGpu>` and would never run `Drop`.
+//! The `Box` is created in `evt_device_add` and freed in the device's
+//! `EvtCleanupCallback` (see pnp.rs).
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::mem::size_of;
+
+use alloc::boxed::Box;
 
 use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
-use wdk_sys::KSPIN_LOCK;
+use wdk_sys::{
+    call_unsafe_wdf_function_binding, KSPIN_LOCK, LPCSTR, PCWDF_OBJECT_CONTEXT_TYPE_INFO, ULONG,
+    WDFOBJECT, WDF_OBJECT_CONTEXT_TYPE_INFO,
+};
 
-use crate::dxgk::*;
 use crate::error::DriverError;
+use crate::fence::FenceTable;
+use crate::mapping::MappingTable;
 use crate::virtio::VirtioGpu;
 
+/// The WDF typed context stored inline in the device object. POD: a zeroed
+/// instance (what WDF hands out before we initialize it) is a valid null
+/// pointer, so there is no drop-of-uninitialized hazard. The real state lives
+/// behind `adapter`.
+#[repr(C)]
+pub struct DeviceContext {
+    /// Heap-`Box`ed [`AdapterContext`], or null before `evt_device_add` sets it.
+    pub adapter: *mut AdapterContext,
+}
+
+/// Self-referential `WDF_OBJECT_CONTEXT_TYPE_INFO` for [`DeviceContext`] — the
+/// Rust equivalent of `WDF_DECLARE_CONTEXT_TYPE`. `UniqueType` must point at this
+/// very record (WDF uses the pointer as the context-type key, consistently at
+/// registration and lookup). A `static` may legally reference its own address in
+/// its initializer; the newtype wrapper supplies the `Sync` that the raw
+/// pointers inside the WDK struct otherwise lack.
+#[repr(transparent)]
+struct ContextTypeInfo(WDF_OBJECT_CONTEXT_TYPE_INFO);
+// SAFETY: the record is immutable after program load and only read by WDF; the
+// raw pointers it holds (its own address + a static C string) are valid for the
+// program's lifetime.
+unsafe impl Sync for ContextTypeInfo {}
+
+static DEVICE_CONTEXT_TYPE_INFO: ContextTypeInfo = ContextTypeInfo(WDF_OBJECT_CONTEXT_TYPE_INFO {
+    Size: size_of::<WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
+    ContextName: b"HeliosDeviceContext\0".as_ptr() as LPCSTR,
+    ContextSize: size_of::<DeviceContext>(),
+    // Self-reference: the type-info record is its own unique key.
+    UniqueType: &DEVICE_CONTEXT_TYPE_INFO.0 as PCWDF_OBJECT_CONTEXT_TYPE_INFO,
+    EvtDriverGetUniqueContextType: None,
+});
+
+/// `PCWDF_OBJECT_CONTEXT_TYPE_INFO` for `WDF_OBJECT_ATTRIBUTES.ContextTypeInfo`
+/// and for the typed-context worker lookup.
+pub fn device_context_type_info() -> PCWDF_OBJECT_CONTEXT_TYPE_INFO {
+    &DEVICE_CONTEXT_TYPE_INFO.0 as PCWDF_OBJECT_CONTEXT_TYPE_INFO
+}
+
+/// Raw pointer to the inline [`DeviceContext`] of a WDF object created with
+/// `DEVICE_CONTEXT_TYPE_INFO` (i.e. the WDFDEVICE).
+///
+/// # Safety
+/// `handle` must be such an object; otherwise the worker returns null.
+unsafe fn device_context_ptr(handle: WDFOBJECT) -> *mut DeviceContext {
+    // SAFETY: WdfObjectGetTypedContextWorker returns the inline context pointer
+    // for the registered type; non-null for our device. The macro injects the
+    // WDF globals + function-table dispatch.
+    let p = call_unsafe_wdf_function_binding!(
+        WdfObjectGetTypedContextWorker,
+        handle,
+        device_context_type_info()
+    ) as *mut DeviceContext;
+    debug_assert!(!p.is_null());
+    p
+}
+
+/// EXCLUSIVE `&mut` to the inline [`DeviceContext`]. ONLY for the
+/// PnP/cleanup-serialized callers — `evt_device_add` (stores the `Box`) and
+/// `free_adapter` (nulls it). Must NOT be used on the concurrent (parallel
+/// queue) IOCTL path, where overlapping `&mut` to the one inline context would
+/// be undefined behavior; that path uses [`adapter_of`] instead.
+///
+/// # Safety
+/// `handle` must be our WDFDEVICE, and the caller must hold the de-facto
+/// exclusivity the PnP/cleanup lifecycle provides.
+pub unsafe fn device_context_mut<'a>(handle: WDFOBJECT) -> &'a mut DeviceContext {
+    &mut *device_context_ptr(handle)
+}
+
+/// Shared borrow of the live [`AdapterContext`] for a WDFDEVICE (or `None` if not
+/// yet set). This is the concurrent IOCTL read path: it reads the `adapter`
+/// pointer via a RAW read and never materializes a `&mut DeviceContext`, so
+/// parallel callers do not form overlapping `&mut` aliases. The `adapter` field
+/// is written only under PnP serialization (`evt_device_add` before the
+/// interface is openable; `free_adapter` in cleanup after all IRPs drain), never
+/// concurrently with live IOCTL dispatch.
+///
+/// # Safety
+/// `handle` must be our WDFDEVICE. The returned reference is valid until the
+/// device's `EvtCleanupCallback` frees the `Box`.
+pub unsafe fn adapter_of<'a>(handle: WDFOBJECT) -> Option<&'a AdapterContext> {
+    let p = device_context_ptr(handle);
+    // Raw read of the field — no `&`/`&mut` to `*p` is materialized.
+    let adapter = core::ptr::addr_of!((*p).adapter).read();
+    if adapter.is_null() {
+        None
+    } else {
+        Some(&*adapter)
+    }
+}
+
 pub struct AdapterContext {
-    /// Physical device object for the virtio-gpu device.
-    pub pdo: PDEVICE_OBJECT,
-    /// Dxgkrnl callback interface, saved in StartDevice. `None` until then.
-    /// Written once during the (serialized) StartDevice lifecycle DDI.
-    pub dxgkrnl: Option<DXGKRNL_INTERFACE>,
     /// Serializes ALL access to `virtio` (the control virtqueue + the shared
-    /// scratch page). Held by present/escape submissions at PASSIVE_LEVEL and,
-    /// from 7.2, by the used-ring DPC at DISPATCH_LEVEL — a spinlock (not a mutex)
+    /// scratch page). Held by IOCTL submissions at PASSIVE_LEVEL and, from
+    /// Phase 4, by the used-ring DPC at DISPATCH_LEVEL — a spinlock (not a mutex)
     /// is mandatory because the DPC path cannot block. `0` is the initialized +
     /// unlocked state of a `KSPIN_LOCK`, so no explicit `KeInitializeSpinLock` is
     /// required (same rationale as the BAR-mapping cache in `virtio::hal`).
     virtio_lock: UnsafeCell<KSPIN_LOCK>,
-    /// The virtio-gpu transport, brought up in `DxgkDdiStartDevice`.
-    /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
+    /// The virtio-gpu transport, brought up in `evt_device_prepare_hardware`.
+    /// Guarded by `virtio_lock`; `None` until PrepareHardware (and after
+    /// ReleaseHardware).
     virtio: UnsafeCell<Option<VirtioGpu>>,
-    /// Kernel VA of the virtio `VIRTIO_PCI_ISR` status register (0 = none/down).
-    /// Read+ack'd LOCK-FREE from `DxgkDdiInterruptRoutine` at DIRQL — it cannot take
-    /// `virtio_lock` (a DISPATCH-level spinlock), so the ISR register VA lives here
-    /// as a plain atomic, set in StartDevice after the transport is up and cleared in
-    /// StopDevice. Reading the register de-asserts the virtio INTx line; without it
-    /// an asserted (e.g. config-change) interrupt re-fires forever — an interrupt
-    /// storm that hard-hangs the guest (our ISR previously never acked).
-    pub isr_status_va: AtomicUsize,
-    /// VioGpuDod-style per-source current-mode flags. The scanout can exist from
-    /// StartDevice, but the VidPN source is not considered active until
-    /// CommitVidPn realizes the committed source mode.
-    current_mode_flags: AtomicU32,
-    current_rotation: AtomicU32,
+    /// fence_id → KEVENT table for the async `IOCTL_HELIOS_WAIT_FENCE` path.
+    /// Present and functional; wired to the used-ring DPC in Phase 4 (today's
+    /// submit path is synchronous, so WAIT_FENCE completes trivially).
+    #[allow(dead_code)]
+    pub fences: FenceTable,
+    /// Live host-visible blob mappings (resource_id → user VA + MDL), recorded by
+    /// `IOCTL_HELIOS_MAP_BLOB` and drained by `EvtFileCleanup`. Lives here (not in
+    /// `virtio`) so teardown survives transport release — see [`MappingTable`].
+    pub mappings: MappingTable,
 }
 
-const CM_FRAMEBUFFER_ACTIVE: u32 = 1 << 0;
-const CM_SOURCE_NOT_VISIBLE: u32 = 1 << 1;
-const CM_FULLSCREEN_PRESENT: u32 = 1 << 2;
-
-// SAFETY: `dxgkrnl` is written only during the device-lifecycle DDIs, which
-// Dxgkrnl serializes. `virtio` is interior-mutable but every access goes through
+// SAFETY: `virtio` is interior-mutable but every access goes through
 // `virtio_lock` (a kernel spinlock) via `with_virtio`/`set_virtio`, so concurrent
-// present/DPC callers never alias it.
+// IOCTL/DPC callers never alias it. `fences` is internally synchronized by its
+// own spinlock. The `Box<AdapterContext>` is shared across the device's IOCTL,
+// PnP, and interrupt callbacks via the WDF context pointer.
 unsafe impl Send for AdapterContext {}
 unsafe impl Sync for AdapterContext {}
 
 impl AdapterContext {
-    pub fn new(pdo: PDEVICE_OBJECT) -> Result<Self, DriverError> {
-        Ok(Self {
-            pdo,
-            dxgkrnl: None,
+    pub fn new() -> Self {
+        Self {
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
-            isr_status_va: AtomicUsize::new(0),
-            current_mode_flags: AtomicU32::new(CM_SOURCE_NOT_VISIBLE),
-            current_rotation: AtomicU32::new(
-                _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY as u32,
-            ),
-        })
-    }
-
-    /// Borrow the Dxgkrnl interface, or fail if StartDevice has not run yet.
-    pub fn dxgkrnl(&self) -> Result<&DXGKRNL_INTERFACE, DriverError> {
-        self.dxgkrnl.as_ref().ok_or(DriverError::DeviceNotFound)
+            fences: FenceTable::new(),
+            mappings: MappingTable::new(),
+        }
     }
 
     /// Install (or clear) the virtio transport under the lock.
@@ -88,8 +163,8 @@ impl AdapterContext {
     /// The previous transport, if any, is dropped *after* the lock is released:
     /// `VirtioGpu::drop` resets the device and frees contiguous memory, both of
     /// which are PASSIVE_LEVEL-only — they must not run at the DISPATCH_LEVEL the
-    /// spinlock raises to. MUST be called at PASSIVE_LEVEL (StartDevice /
-    /// StopDevice, which Dxgkrnl serializes).
+    /// spinlock raises to. MUST be called at PASSIVE_LEVEL (PrepareHardware /
+    /// ReleaseHardware, which the PnP manager serializes).
     pub fn set_virtio(&self, new: Option<VirtioGpu>) {
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
         // swaps the Option in/out of the cell (no allocation, no device I/O).
@@ -117,63 +192,23 @@ impl AdapterContext {
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         result
     }
+}
 
-    pub fn reset_current_mode(&self) {
-        self.current_mode_flags
-            .store(CM_SOURCE_NOT_VISIBLE, Ordering::Release);
-        self.current_rotation.store(
-            _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY as u32,
-            Ordering::Release,
-        );
-    }
-
-    pub fn mark_framebuffer_active(&self, active: bool) {
-        if active {
-            self.current_mode_flags.fetch_or(
-                CM_FRAMEBUFFER_ACTIVE | CM_FULLSCREEN_PRESENT,
-                Ordering::AcqRel,
-            );
-        } else {
-            self.current_mode_flags
-                .fetch_and(!CM_FRAMEBUFFER_ACTIVE, Ordering::AcqRel);
-        }
-    }
-
-    pub fn mark_fullscreen_present(&self) {
-        self.current_mode_flags
-            .fetch_or(CM_FULLSCREEN_PRESENT, Ordering::AcqRel);
-    }
-
-    pub fn set_source_visible(&self, visible: bool) {
-        if visible {
-            self.current_mode_flags.fetch_and(!CM_SOURCE_NOT_VISIBLE, Ordering::AcqRel);
-            self.current_mode_flags
-                .fetch_or(CM_FULLSCREEN_PRESENT, Ordering::AcqRel);
-        } else {
-            self.current_mode_flags
-                .fetch_or(CM_SOURCE_NOT_VISIBLE, Ordering::AcqRel);
-        }
-    }
-
-    pub fn source_not_visible(&self) -> bool {
-        self.current_mode_flags.load(Ordering::Acquire) & CM_SOURCE_NOT_VISIBLE != 0
-    }
-
-    pub fn framebuffer_active(&self) -> bool {
-        self.current_mode_flags.load(Ordering::Acquire) & CM_FRAMEBUFFER_ACTIVE != 0
-    }
-
-    pub fn set_rotation(&self, rotation: _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::Type) {
-        self.current_rotation
-            .store(rotation as u32, Ordering::Release);
-    }
-
-    pub fn rotation(&self) -> _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::Type {
-        match self.current_rotation.load(Ordering::Acquire) {
-            x if x == _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_ROTATE90 as u32 => {
-                _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_ROTATE90
-            }
-            _ => _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY,
-        }
+/// Free the heap `AdapterContext` a device owns. Called from the device's
+/// `EvtCleanupCallback`.
+///
+/// # Safety
+/// `device` must be our WDFDEVICE. Runs at PASSIVE_LEVEL (device cleanup). The
+/// virtio transport must already have been torn down in ReleaseHardware so the
+/// `Box` here frees only the (transport-empty) shell.
+pub unsafe fn free_adapter(device: WDFOBJECT) {
+    // Cleanup is serialized w.r.t. IOCTL dispatch (runs after all IRPs drain), so
+    // the exclusive &mut is sound here.
+    let ctx = device_context_mut(device);
+    if !ctx.adapter.is_null() {
+        // SAFETY: `adapter` was produced by Box::into_raw in evt_device_add and
+        // is freed exactly once (here).
+        drop(unsafe { Box::from_raw(ctx.adapter) });
+        ctx.adapter = core::ptr::null_mut();
     }
 }
