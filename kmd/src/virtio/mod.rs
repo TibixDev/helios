@@ -46,9 +46,9 @@ impl From<VirtioError> for NTSTATUS {
     fn from(e: VirtioError) -> Self {
         match e {
             VirtioError::OutOfMemory | VirtioError::MmioMapFailed => STATUS_INSUFFICIENT_RESOURCES,
-            VirtioError::CapNotFound
-            | VirtioError::FeatureRejected
-            | VirtioError::DeviceError => STATUS_IO_DEVICE_ERROR,
+            VirtioError::CapNotFound | VirtioError::FeatureRejected | VirtioError::DeviceError => {
+                STATUS_IO_DEVICE_ERROR
+            }
             VirtioError::NotImplemented => STATUS_NOT_IMPLEMENTED,
         }
     }

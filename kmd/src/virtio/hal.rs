@@ -87,7 +87,7 @@ use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock, MmAllocateContiguousMemory,
     MmFreeContiguousMemory, MmGetPhysicalAddress, MmMapIoSpace, MmUnmapIoSpace,
 };
-use wdk_sys::{KSPIN_LOCK, PHYSICAL_ADDRESS, _MEMORY_CACHING_TYPE};
+use wdk_sys::{_MEMORY_CACHING_TYPE, KSPIN_LOCK, PHYSICAL_ADDRESS};
 
 const PAGE_SIZE: usize = 4096;
 /// Distinct BAR sub-regions a virtio device maps (common/notify/ISR/device cfg),
@@ -135,8 +135,7 @@ impl WdkHal {
         // SAFETY: spinlock-guarded; swap the table out under the lock, then
         // unmap each entry at PASSIVE_LEVEL outside the lock.
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(lock) };
-        let taken =
-            unsafe { core::mem::replace(&mut *MMIO_CACHE.entries.get(), [None; MAX_MMIO]) };
+        let taken = unsafe { core::mem::replace(&mut *MMIO_CACHE.entries.get(), [None; MAX_MMIO]) };
         unsafe { KeReleaseSpinLock(lock, irql) };
         for m in taken.iter().flatten() {
             // SAFETY: `va` was returned by `MmMapIoSpace` in `mmio_phys_to_virt`.

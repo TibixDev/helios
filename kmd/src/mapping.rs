@@ -128,13 +128,10 @@ impl MappingTable {
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
         // SAFETY: spinlock-guarded exclusive access to the entries.
         let entries = unsafe { &mut *self.entries.get() };
-        let popped = entries
-            .iter()
-            .position(|m| m.owner == owner)
-            .map(|i| {
-                let m = entries.swap_remove(i);
-                (m.user_va, m.mdl)
-            });
+        let popped = entries.iter().position(|m| m.owner == owner).map(|i| {
+            let m = entries.swap_remove(i);
+            (m.user_va, m.mdl)
+        });
         unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
         popped
     }

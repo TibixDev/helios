@@ -46,14 +46,15 @@ User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID
 | 5 Vulkan ICD | Mesa venus port over IOCTL; loader-registry JSON |
 | 6 DXVK / VKD3D | App-level validation |
 
-**STATUS (updated 2026-06-07):** Phases 0–5 + WSI bring-up reached a working baseline — the System-class KMDF driver + the Mesa
-**venus ICD** render end-to-end on real hardware: `vulkaninfo` reports `driverName venus`, and
-`vkCreateDevice` + host-visible `vkAllocateMemory`/`vkMapMemory` + a `vkCmdFillBuffer`+`vkQueueSubmit`
-round-trip real GPU output on the Intel ARL iGPU; vkcube even renders via the software WSI path (but at
-<1 fps, so it is not a renderer-performance benchmark). The WDDM **render** miniport stays abandoned. The DOD
-display pivot is archived. **NEXT:** restore the System-class driver setup and improve Venus performance
-directly: async submit, interrupt/DPC fence completion, blob mapping lifetime, offscreen render throughput, then
-DXVK/VKD3D validation.
+**STATUS (updated 2026-06-07):** Phases 0–5 + WSI bring-up reached a usable working baseline — the System-class KMDF driver + the Mesa
+**venus ICD** render end-to-end on real hardware: `vulkaninfo` reports `driverName venus`, cached
+`HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` memory works through the Windows BAR mapping path, `vkCmdFillBuffer`
+readback passes, and `vkcube` renders normally through Win32 WSI. The ICD now keeps Windows cache visibility
+explicit for cached coherent mappings and feedback slots, and device teardown tolerates clients that exit with
+mapped coherent memory still live. The WDDM **render** miniport stays abandoned. The DOD display pivot is archived
+unless a display/scanout experiment is explicitly chosen. **NEXT:** benchmark renderer throughput separately from
+QXL/SPICE display transport, then decide whether display work should be a separate virtio-gpu display device,
+IDD, or DOD scanout project.
 
 **KMDF callbacks the driver registers:** `EvtDriverDeviceAdd`, `EvtDevicePrepareHardware`, `EvtDeviceReleaseHardware`, `EvtDeviceD0Entry`, `EvtDeviceD0Exit`, `EvtIoDeviceControl`, `EvtInterruptIsr`, `EvtInterruptDpc`.
 

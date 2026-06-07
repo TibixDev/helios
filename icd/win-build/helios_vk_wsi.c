@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VK_NO_PROTOTYPES
@@ -257,7 +258,13 @@ main(void)
       .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1,
    };
 
-   const int FRAMES = 8;
+   int FRAMES = 8;
+   const char *frames_env = getenv("HELIOS_WSI_FRAMES");
+   if (frames_env) {
+      int parsed = atoi(frames_env);
+      if (parsed > 0)
+         FRAMES = parsed;
+   }
    for (int f = 0; f < FRAMES; f++) {
       MSG msg;
       while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {

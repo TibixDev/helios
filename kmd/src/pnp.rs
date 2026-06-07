@@ -11,12 +11,12 @@
 
 use alloc::boxed::Box;
 
+use wdk_sys::NT_SUCCESS;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, BUS_INTERFACE_STANDARD, GUID, NTSTATUS, PINTERFACE,
-    PWDFDEVICE_INIT, USHORT, WDFCMRESLIST, WDFDEVICE, WDFDRIVER, WDFOBJECT, WDFQUEUE,
-    WDF_NO_OBJECT_ATTRIBUTES, WDF_POWER_DEVICE_STATE, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    PWDFDEVICE_INIT, STATUS_SUCCESS, STATUS_UNSUCCESSFUL, USHORT, WDFCMRESLIST, WDFDEVICE,
+    WDFDRIVER, WDFOBJECT, WDFQUEUE, WDF_NO_OBJECT_ATTRIBUTES, WDF_POWER_DEVICE_STATE,
 };
-use wdk_sys::NT_SUCCESS;
 
 use crate::adapter::{
     adapter_of, device_context_mut, device_context_type_info, free_adapter, AdapterContext,
@@ -43,7 +43,11 @@ pub unsafe extern "C" fn evt_device_add(
     );
     // SAFETY: `device_init` is the OS-provided init object (valid for this
     // callback); `&mut pnp` is a valid PWDF_PNPPOWER_EVENT_CALLBACKS.
-    call_unsafe_wdf_function_binding!(WdfDeviceInitSetPnpPowerEventCallbacks, device_init, &mut pnp);
+    call_unsafe_wdf_function_binding!(
+        WdfDeviceInitSetPnpPowerEventCallbacks,
+        device_init,
+        &mut pnp
+    );
 
     // Set the device I/O type (the one device-init call the working mvisor
     // reference makes that we omitted). SAFETY: `device_init` valid.
@@ -82,8 +86,12 @@ pub unsafe extern "C" fn evt_device_add(
     //     our local on success — never touch `device_init` afterward.
     let mut device: WDFDEVICE = core::ptr::null_mut();
     // SAFETY: all three pointers are valid; on success `device` is set.
-    let status =
-        call_unsafe_wdf_function_binding!(WdfDeviceCreate, &mut device_init, &mut attrs, &mut device);
+    let status = call_unsafe_wdf_function_binding!(
+        WdfDeviceCreate,
+        &mut device_init,
+        &mut attrs,
+        &mut device
+    );
     if !NT_SUCCESS(status) {
         kmsg(c"Helios: WdfDeviceCreate failed\n");
         return status;

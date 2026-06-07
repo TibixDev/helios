@@ -143,15 +143,8 @@ impl FenceTable {
             &mut timeout
         };
         // SAFETY: `ev` is a live KEVENT at a stable address; PASSIVE_LEVEL wait.
-        let status = unsafe {
-            KeWaitForSingleObject(
-                ev as PVOID,
-                EXECUTIVE,
-                KERNEL_MODE,
-                0,
-                timeout_ptr,
-            )
-        };
+        let status =
+            unsafe { KeWaitForSingleObject(ev as PVOID, EXECUTIVE, KERNEL_MODE, 0, timeout_ptr) };
 
         // Free the slot.
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };

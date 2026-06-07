@@ -19,20 +19,21 @@ use alloc::vec::Vec;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeMapBlob,
-    HeliosEscapePresentBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence, IOCTL_HELIOS_ALLOC_BLOB,
-    IOCTL_HELIOS_CTX_CREATE, IOCTL_HELIOS_CTX_DESTROY, IOCTL_HELIOS_MAP_BLOB,
-    IOCTL_HELIOS_PRESENT_BLOB, IOCTL_HELIOS_SUBMIT_VENUS, IOCTL_HELIOS_WAIT_FENCE,
-    VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
+    HeliosEscapePresentBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
+    IOCTL_HELIOS_ALLOC_BLOB, IOCTL_HELIOS_CTX_CREATE, IOCTL_HELIOS_CTX_DESTROY,
+    IOCTL_HELIOS_MAP_BLOB, IOCTL_HELIOS_PRESENT_BLOB, IOCTL_HELIOS_SUBMIT_VENUS,
+    IOCTL_HELIOS_WAIT_FENCE, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED,
+    VIRTIO_GPU_MAP_CACHE_WC,
 };
 use wdk_sys::ntddk::{
     IoAllocateMdl, IoFreeMdl, KeDelayExecutionThread, MmMapLockedPagesSpecifyCache,
     MmUnmapLockedPages,
 };
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, LARGE_INTEGER, MDL, NTSTATUS, PMDL, PVOID, ULONG, ULONG_PTR,
-    WDFFILEOBJECT, WDFOBJECT, WDFQUEUE, WDFREQUEST, NT_SUCCESS, STATUS_DEVICE_DOES_NOT_EXIST,
-    STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-    STATUS_IO_TIMEOUT, STATUS_SUCCESS, _MEMORY_CACHING_TYPE,
+    call_unsafe_wdf_function_binding, _MEMORY_CACHING_TYPE, LARGE_INTEGER, MDL, NTSTATUS,
+    NT_SUCCESS, PMDL, PVOID, STATUS_DEVICE_DOES_NOT_EXIST, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_SUCCESS,
+    ULONG, ULONG_PTR, WDFFILEOBJECT, WDFOBJECT, WDFQUEUE, WDFREQUEST,
 };
 
 use crate::adapter::{adapter_of, AdapterContext};
@@ -154,10 +155,18 @@ unsafe fn handle_ctx_create(adapter: &AdapterContext, request: WDFREQUEST) -> (N
     };
     // SAFETY: WDF guaranteed ≥ sz bytes at in_ptr/out_ptr. Read unaligned.
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
+    // Tag the context with the file object so EvtFileCleanup can destroy it if
+    // the client exits before issuing CTX_DESTROY.
+    let file_object = call_unsafe_wdf_function_binding!(WdfRequestGetFileObject, request);
+    if file_object.is_null() {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+
     // Per-call free list for any in-flight async submits reaped while quiescing
     // the control queue; dropped here at PASSIVE after with_virtio releases the lock.
     let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
-    match adapter.with_virtio(|v| v.ctx_create(req.capset_id, &mut retired)) {
+    let owner = file_object as usize;
+    match adapter.with_virtio(|v| v.ctx_create(req.capset_id, owner, &mut retired)) {
         Ok(Ok(ctx_id)) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
@@ -318,7 +327,15 @@ unsafe fn handle_submit_venus(adapter: &AdapterContext, request: WDFREQUEST) -> 
     // the meta/venus bindings + the reference, not the Vec itself).
     let retired_ref = &mut retired;
     let status = match adapter.with_virtio(move |v| {
-        v.submit_venus(ctx_id, fence_id, ring_idx, meta, venus, payload, retired_ref)
+        v.submit_venus(
+            ctx_id,
+            fence_id,
+            ring_idx,
+            meta,
+            venus,
+            payload,
+            retired_ref,
+        )
     }) {
         Ok(Ok(())) => STATUS_SUCCESS,
         Ok(Err(ve)) => ve.into(),
@@ -470,6 +487,12 @@ unsafe fn handle_map_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTS
     // Phase 2 — at PASSIVE_LEVEL, in the caller's process, holding NO lock: build
     // an MDL over the host-visible BAR pages and map it into user space.
     let cache = map_cache_to_mm(prep.map_cache);
+    crate::kmsg(match prep.map_cache {
+        VIRTIO_GPU_MAP_CACHE_CACHED => c"Helios: MAP_BLOB cache=CACHED\n",
+        VIRTIO_GPU_MAP_CACHE_WC => c"Helios: MAP_BLOB cache=WC\n",
+        VIRTIO_GPU_MAP_CACHE_UNCACHED => c"Helios: MAP_BLOB cache=UNCACHED\n",
+        _ => c"Helios: MAP_BLOB cache=UNKNOWN\n",
+    });
     let (user_va, mdl) = match map_io_pages_to_user(prep.gpa, prep.size, cache) {
         Some(x) => x,
         None => return (STATUS_INSUFFICIENT_RESOURCES, 0),
@@ -499,10 +522,7 @@ fn map_cache_to_mm(map_cache: u32) -> _MEMORY_CACHING_TYPE::Type {
         VIRTIO_GPU_MAP_CACHE_CACHED => _MEMORY_CACHING_TYPE::MmCached,
         VIRTIO_GPU_MAP_CACHE_WC => _MEMORY_CACHING_TYPE::MmWriteCombined,
         VIRTIO_GPU_MAP_CACHE_UNCACHED => _MEMORY_CACHING_TYPE::MmNonCached,
-        // NONE / unknown: the host expressed no preference. Cached matches the
-        // common host-coherent venus heap; only end-to-end venus traffic (the ICD)
-        // exercises non-CACHED values, at which point the host always sets one.
-        _ => _MEMORY_CACHING_TYPE::MmCached,
+        _ => _MEMORY_CACHING_TYPE::MmNonCached,
     }
 }
 
@@ -560,14 +580,8 @@ unsafe fn map_io_pages_to_user(
     // SAFETY: `mdl` is a valid, populated, locked MDL; maps into the current
     // (user) process. BugCheckOnFailure = FALSE (ignored for UserMode — see the
     // exception note above).
-    let va = MmMapLockedPagesSpecifyCache(
-        mdl,
-        USER_MODE,
-        cache,
-        core::ptr::null_mut(),
-        0,
-        priority,
-    );
+    let va =
+        MmMapLockedPagesSpecifyCache(mdl, USER_MODE, cache, core::ptr::null_mut(), 0, priority);
     if va.is_null() {
         // Unreached for UserMode (it raises rather than returning NULL), but freed
         // here for completeness if a future kernel build returns NULL.
@@ -617,4 +631,7 @@ pub unsafe extern "C" fn evt_file_cleanup(file_object: WDFFILEOBJECT) {
     while let Some((user_va, mdl)) = adapter.mappings.take_one_for(owner) {
         unmap_io_pages_from_user(user_va, mdl as PMDL);
     }
+
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    let _ = adapter.with_virtio(|v| v.ctx_destroy_for_owner(owner, &mut retired));
 }

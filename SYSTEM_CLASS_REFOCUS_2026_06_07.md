@@ -19,8 +19,12 @@ The DOD path serves a different goal: replacing the Windows display adapter and 
   - `vkCreateDevice` worked.
   - host-visible `vkAllocateMemory`/`vkMapMemory` worked.
   - `vkCmdFillBuffer` + submit + fence + readback produced expected data.
-- `vkcube` was extremely slow through the Windows software WSI path, around 0.3 fps / sub-1 fps.
-- That slowness points at present/readback/visibility behavior, not necessarily at Venus command throughput.
+- The current System-class path now exposes cached `HOST_COHERENT` Venus memory correctly on Windows:
+  - Mesa tracks cached coherent mapped allocations and flushes/invalidate them around queue submission and wait completion.
+  - feedback slots are cache-flushed/invalidated on Windows, so fence-feedback correctness checks are no longer masked.
+  - `vkcube` renders normally on the System-class Venus ICD after the coherency and Win32 WSI fixes.
+  - teardown handles clients that exit without unmapping/freeing all cached coherent memory; the ICD no longer trips the internal device-list or mutex assertions on close.
+- The remaining visible frame drops while `vkcube` runs are a display transport/composition issue, not evidence that Venus command execution is broken. The VM display is still QXL/SPICE and Windows desktop composition is not accelerated by the System-class Vulkan ICD.
 - The DOD path consumed large effort in VidPN/visibility/Code 43 debugging without directly improving Venus rendering.
 - Recent DOD testing showed virtio 2D transfer/flush can paint the host surface, but dxgkrnl VidPN negotiation remains fragile:
   - allowing all unpinned transforms avoids hidden source but reintroduces `EnumVidPnCofuncModality <-> IsSupportedVidPn` loops and Code 43;
@@ -45,26 +49,27 @@ Active primary path:
 
 ## Immediate Engineering Plan
 
-1. Restore or keep the VM XML that worked with the old System-class driver.
-2. Re-establish the System-class KMDF build/install/test loop.
-3. Benchmark Venus without window presentation:
+1. Keep the System-class KMDF build/install/test loop as the renderer baseline.
+2. Continue benchmarking Venus without making QXL/SPICE display behavior the primary metric:
    - `vulkaninfo`
    - device creation
    - `vkCmdFillBuffer`
    - render-to-image
    - fence latency
    - submit throughput
-4. Fix performance in the Venus transport first:
+3. Fix performance in the Venus transport first:
    - async submit path;
    - interrupt/DPC fence completion;
    - no long spin waits under driver locks;
    - persistent host-visible blob mappings;
    - no avoidable CPU copies for command streams or mapped memory.
-5. Treat window/display present separately after offscreen Venus is fast.
+4. Treat display present separately from renderer correctness:
+   - QXL/SPICE can bottleneck the whole desktop while a Vulkan window updates.
+   - a future display path must be chosen explicitly: continue with QXL/SPICE, add a separate display device, build an IDD, or revive a DOD only for scanout ownership.
 
 ## Presentation Strategy
 
-Windowed Win32 WSI remains expected to be limited because it requires guest-side presentation into a normal Windows desktop that is not GPU-composited by Helios.
+Windowed Win32 WSI now works well enough for `vkcube`, but it still presents into a normal Windows desktop that is not GPU-composited by Helios. With QXL/SPICE as the display path, high-frequency updates can still drop frames across the desktop even when Venus rendering itself is healthy.
 
 Do not spend more time on DOD until these are true:
 
