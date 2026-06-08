@@ -429,6 +429,24 @@ Recent caveats:
   observing a render/present sync as complete while an older host frame can still surface.
 - Windowed WSI performance should be measured separately from Looking Glass IDD capture/export stalls. A hitch in
   the displayed desktop can come from either Venus/KMD waits or the IDD/KVMFR copy path.
+- `HELIOS_WSI_PERF=1` enables opt-in Mesa WSI timing. Use it with `HELIOS_WSI_PERF_FILE=%USERPROFILE%\helios-doom-wsi-perf.txt`
+  to split a software-present frame into common WSI fence wait, memory invalidate, Win32 copy, `GetDC`, and
+  `StretchDIBits` cost. Keep `HELIOS_PERF_LIVE` unset for Doom runs; live per-IOCTL logging perturbs timing.
+- The Win32 software WSI backend copies mapped Venus image data into the normal DIB by default before calling
+  `StretchDIBits`. Directly passing the mapped Venus image to GDI is kept only as `HELIOS_WSI_DIRECT_MAP=1` for A/B
+  testing because GDI reads from that mapped memory measured much slower on Doom.
+- The direct Looking Glass producer path is enabled by default. Mesa Win32 WSI opens the dedicated
+  `\\.\pipe\LookingGlassIDDHelios` pipe, maps the IVSHMEM/KVMFR device, asks the IDD for a writable frame slot,
+  copies the Venus software-present image into that slot, and asks the IDD to post the LGMP frame. If pipe setup,
+  IVSHMEM mapping, acquire, or commit fails, the ICD disables the path for the process and falls back to GDI. Set
+  `HELIOS_LG_DIRECT=0` to opt out and force the old GDI path for a process.
+- Host renderer choice is now a first-order test variable. On this machine, NVIDIA-backed virglrenderer/Venus made
+  Doom 2016 show black/white frames and could corrupt/freeze the Linux host desktop. Intel-backed Venus is correct
+  enough to play Doom, but slower. Keep Intel as the default correctness baseline until the NVIDIA path is isolated
+  and fixed.
+- WDDM/DXGI remains a possible future escape hatch, not the next default step. It would require a real WDDM render
+  adapter path rather than only the current System-class DeviceIoControl KMD, and it would not by itself implement
+  D3D12. Optimize and measure the current Venus path first.
 
 ---
 

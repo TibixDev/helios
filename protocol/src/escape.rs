@@ -132,7 +132,7 @@ pub struct HeliosEscapeMapBlob {
     pub hdr: HeliosEscapeHeader,
     pub out_user_va: u64,  // out: user-mode virtual address of the mapping
     pub resource_id: u32,  // in:  blob to map
-    pub padding: u32,
+    pub map_cache: u32,    // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
 }
 
 /// `HELIOS_ESCAPE_WAIT_FENCE`. 32 bytes.

@@ -354,6 +354,9 @@ unsafe fn handle_submit_venus(adapter: &AdapterContext, request: WDFREQUEST) -> 
 const WAIT_FENCE_POLL_INTERVAL_100NS: i64 = -1_000;
 /// The same interval in nanoseconds, for deriving the timeout iteration count.
 const WAIT_FENCE_POLL_INTERVAL_NS: u64 = 100_000;
+/// Number of immediate used-ring re-checks before sleeping. This avoids turning
+/// a fence that retires just after the first poll into a scheduler-delay wait.
+const WAIT_FENCE_SPIN_POLLS: u32 = 4_096;
 
 /// `IOCTL_HELIOS_WAIT_FENCE` → block until `fence_id` completes or `timeout_ns`
 /// elapses (Phase 4e). Submission is now asynchronous, so the host fence may not
@@ -362,10 +365,12 @@ const WAIT_FENCE_POLL_INTERVAL_NS: u64 = 100_000;
 /// Poll-first model (no interrupt yet — see the interrupt blocker in the Phase-4e
 /// handover): there is no DPC to signal a KEVENT, so this drives the used ring
 /// itself. Each iteration reaps completions under the virtio lock
-/// ([`VirtioGpu::fence_complete`]) and, if the target is not yet complete, sleeps
-/// a short interval at PASSIVE_LEVEL before re-checking. `fence_complete` is
-/// out-of-order-safe (a fence is done once it is submitted and no longer
-/// in-flight), so this is correct even under per-`ring_idx` fence routing.
+/// ([`VirtioGpu::fence_complete`]). We poll a bounded number of times before
+/// sleeping because short relative kernel sleeps can overshoot badly; after the
+/// bounded poll phase, the handler sleeps a short interval at PASSIVE_LEVEL before
+/// re-checking. `fence_complete` is out-of-order-safe (a fence is done once it is
+/// submitted and no longer in-flight), so this is correct even under per-`ring_idx`
+/// fence routing.
 ///
 /// `timeout_ns == 0` → poll once (non-blocking). A huge value (venus passes
 /// `UINT64_MAX`) is effectively infinite. On timeout this completes with
@@ -395,6 +400,7 @@ unsafe fn handle_wait_fence(adapter: &AdapterContext, request: WDFREQUEST) -> (N
     let max_sleeps = req.timeout_ns / WAIT_FENCE_POLL_INTERVAL_NS;
     let mut sleeps: u64 = 0;
 
+    let mut spin_polls: u32 = 0;
     loop {
         let done = match adapter.with_virtio(|v| v.fence_complete(req.fence_id, &mut retired)) {
             Ok(Ok(d)) => d,
@@ -414,6 +420,11 @@ unsafe fn handle_wait_fence(adapter: &AdapterContext, request: WDFREQUEST) -> (N
         }
         if sleeps >= max_sleeps {
             return (STATUS_IO_TIMEOUT, 0);
+        }
+        if spin_polls < WAIT_FENCE_SPIN_POLLS {
+            spin_polls += 1;
+            core::hint::spin_loop();
+            continue;
         }
         sleeps += 1;
         // Sleep a short interval at PASSIVE before re-polling the used ring.
@@ -486,8 +497,14 @@ unsafe fn handle_map_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTS
 
     // Phase 2 — at PASSIVE_LEVEL, in the caller's process, holding NO lock: build
     // an MDL over the host-visible BAR pages and map it into user space.
-    let cache = map_cache_to_mm(prep.map_cache);
-    crate::kmsg(match prep.map_cache {
+    let effective_map_cache = match req.map_cache {
+        VIRTIO_GPU_MAP_CACHE_CACHED | VIRTIO_GPU_MAP_CACHE_WC | VIRTIO_GPU_MAP_CACHE_UNCACHED => {
+            req.map_cache
+        }
+        _ => prep.map_cache,
+    };
+    let cache = map_cache_to_mm(effective_map_cache);
+    crate::kmsg(match effective_map_cache {
         VIRTIO_GPU_MAP_CACHE_CACHED => c"Helios: MAP_BLOB cache=CACHED\n",
         VIRTIO_GPU_MAP_CACHE_WC => c"Helios: MAP_BLOB cache=WC\n",
         VIRTIO_GPU_MAP_CACHE_UNCACHED => c"Helios: MAP_BLOB cache=UNCACHED\n",
@@ -511,6 +528,7 @@ unsafe fn handle_map_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTS
 
     let mut out = req;
     out.out_user_va = user_va;
+    out.map_cache = effective_map_cache;
     // SAFETY: ≥ sz writable bytes at out_ptr.
     slice::from_raw_parts_mut(out_ptr, sz).copy_from_slice(bytes_of(&out));
     (STATUS_SUCCESS, sz)

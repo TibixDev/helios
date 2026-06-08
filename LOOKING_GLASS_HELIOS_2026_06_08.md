@@ -55,6 +55,55 @@ the QEMU display backend headless. A SPICE-display client fallback remains avail
 HELIOS_DISPLAY=looking-glass HELIOS_LG_TRANSPORT=spice ./tools/launch-helios-gtk.sh
 ```
 
+The standalone launcher currently defaults to the Intel host render node for QEMU/virglrenderer/Venus, while the
+Looking Glass client defaults to Wayland/EGL on the host default GPU:
+
+```text
+HELIOS_QEMU_RENDER_GPU=intel
+HELIOS_INTEL_RENDER_NODE=/dev/dri/renderD129
+HELIOS_LG_RENDER_GPU=default
+HELIOS_LG_DISPLAY_SERVER=wayland
+HELIOS_LG_RENDERER=EGL
+```
+
+This is the correctness baseline. With the NVIDIA host renderer as Venus GPU0, Doom 2016 produced black/white
+frames and the Linux host desktop could show framebuffer corruption or freeze. With Intel as Venus GPU0, Doom
+launches and plays, including a normal Steam launch. This does not require the Looking Glass client itself to use
+Intel; the client can stay on the default host GPU for viewer-side EGL compositing. The Intel Venus path is slower
+(observed below 20 fps in Doom), so performance work should first measure the Intel baseline and then either
+optimize it or re-enable NVIDIA for QEMU/Venus only after the host-renderer corruption is understood.
+
+For Doom/Venus performance captures, run the diagnostic launcher from the Windows desktop session:
+
+```cmd
+C:\Users\Rupansh\helios-vgpu\tools\launch-doom-diagnostic.cmd
+```
+
+It writes Helios IOCTL timing to `%USERPROFILE%\helios-doom-perf.txt` and Mesa software WSI timing to
+`%USERPROFILE%\helios-doom-wsi-perf.txt`. The WSI file distinguishes common software-present fence wait and memory
+invalidate time from Win32 copy/`GetDC`/`StretchDIBits` time. Keep live IOCTL logging off for Doom runs because it
+can become part of the measured bottleneck. The Win32 WSI backend now defaults back to copying into the normal DIB
+before GDI present; `HELIOS_WSI_DIRECT_MAP=1` can re-enable direct mapped-image present for controlled A/B tests.
+The direct KVMFR producer path is now Mesa WSI's default when the rebuilt IDD pipe is available: Mesa WSI talks to
+the rebuilt IDD over `\\.\pipe\LookingGlassIDDHelios`, writes the presented Venus image into an IDD-owned KVMFR
+frame slot by IVSHMEM offset, and asks the IDD to post the frame to LGMP. This bypasses GDI `StretchDIBits`;
+failures fall back to the normal GDI path for that process. Set `HELIOS_LG_DIRECT=0` to force the old GDI path for
+an A/B run.
+
+The NVIDIA/default path remains available for controlled testing only:
+
+```text
+HELIOS_QEMU_RENDER_GPU=default \
+  HELIOS_DISPLAY=looking-glass ./tools/launch-helios-gtk.sh
+```
+
+Looking Glass KVMFR defaults to 512 MiB so the normal desktop queue and Helios overlay queue have separate frame
+pools. The host `/dev/kvmfr0` backing device must be created at the same size, or the launcher must be overridden
+with `HELIOS_KVMFR_SIZE`.
+
+The launcher also defaults Windows to a single-socket topology (`16,sockets=1,cores=16,threads=1`). Override with
+`HELIOS_SMP`, `HELIOS_SOCKETS`, `HELIOS_CORES`, and `HELIOS_THREADS` if a different topology is needed.
+
 ## Build tooling
 
 `tools/win-mcp` now has a dedicated `win_looking_glass` tool. It mirrors the Linux source tree to the local Windows
@@ -168,6 +217,11 @@ Validated/changed on 2026-06-08:
 - IDD rollback build installed as a new driver package; `HeliosEnable=0` and `HeliosTestPattern=0`.
 - IDD now logs DXGI render-adapter candidates and selection.
 - `HELIOS_DISPLAY=looking-glass` in the standalone script defaults back to KVMFR/ivshmem transport.
+- The standalone script defaults QEMU/Venus to Intel host rendering and passes the Intel render node explicitly to
+  `egl-headless`; the Looking Glass client defaults to Wayland/EGL on the default host renderer.
+- The standalone script defaults KVMFR to 512 MiB for separate normal desktop and Helios overlay frame pools.
+- The standalone script now presents Windows as one socket with sixteen cores by default, instead of sixteen
+  one-core sockets.
 - The standalone script shuts down the VM through QMP/ACPI when the Looking Glass client exits.
 - IDD capture now drops a frame instead of waiting up to 100 ms when all D3D12 copy queues are busy. This favors
   fresh display output over freeze-then-catch-up behavior.

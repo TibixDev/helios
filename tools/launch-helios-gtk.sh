@@ -16,14 +16,28 @@
 #   HELIOS_INT_ACTION=client HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
 # Host client display backend:
-#   HELIOS_LG_DISPLAY_SERVER=x11 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#   HELIOS_LG_DISPLAY_SERVER=x11 HELIOS_LG_RENDERER=OpenGL HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Host GPU used by QEMU/virglrenderer/Venus:
+#   HELIOS_QEMU_RENDER_GPU=default HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Host GPU used by the Looking Glass client:
+#   HELIOS_LG_RENDER_GPU=intel HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Guest CPU topology:
+#   HELIOS_SMP=16 HELIOS_SOCKETS=1 HELIOS_CORES=16 HELIOS_THREADS=1 \
+#     HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
 # If another VM is holding 5900:
 #   HELIOS_SPICE_PORT=5901 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Looking Glass KVMFR defaults to 512 MiB for desktop + Helios overlay queues.
+# Ensure /dev/kvmfr0 was created with the same size, or override:
+#   HELIOS_KVMFR_SIZE=134217728 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 set -uo pipefail
 
 if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
+  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_RENDER_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
     bash "$0" "$@"
 fi
 
@@ -31,20 +45,26 @@ USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
 DISPLAY_MODE=${HELIOS_DISPLAY:-gtk}
+QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-intel}
+INTEL_RENDER_NODE=${HELIOS_INTEL_RENDER_NODE:-/dev/dri/renderD129}
 LG_TRANSPORT=${HELIOS_LG_TRANSPORT:-kvmfr}
 SPICE_PORT=${HELIOS_SPICE_PORT:-5900}
 KVMFR_DEV=${HELIOS_KVMFR_DEV:-/dev/kvmfr0}
-KVMFR_SIZE=${HELIOS_KVMFR_SIZE:-134217728}
+KVMFR_SIZE=${HELIOS_KVMFR_SIZE:-536870912}
 LG_CLIENT=${HELIOS_LG_CLIENT:-$SHARE/LookingGlass/client/build/looking-glass-client}
 LG_RENDER_GPU=${HELIOS_LG_RENDER_GPU:-default}
 LG_DISPLAY_SERVER=${HELIOS_LG_DISPLAY_SERVER:-x11}
-LG_RENDERER=${HELIOS_LG_RENDERER:-auto}
+LG_RENDERER=${HELIOS_LG_RENDERER:-OpenGL}
 LG_ALLOW_DMA=${HELIOS_LG_ALLOW_DMA:-no}
 LG_START_CLIENT=${HELIOS_LG_START_CLIENT:-yes}
 LG_RESTART_CLIENT=${HELIOS_LG_RESTART_CLIENT:-no}
 LG_CLIENT_DELAY=${HELIOS_LG_CLIENT_DELAY:-12}
 LG_CLIENT_LOG=${HELIOS_LG_CLIENT_LOG:-/tmp/helios-looking-glass-client.log}
 INT_ACTION=${HELIOS_INT_ACTION:-shutdown}
+SMP=${HELIOS_SMP:-16}
+SOCKETS=${HELIOS_SOCKETS:-1}
+CORES=${HELIOS_CORES:-16}
+THREADS=${HELIOS_THREADS:-1}
 if [ "${HELIOS_PHASE:-}" != "user" ]; then
   [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
   USER_PHASE_PID=
@@ -83,12 +103,12 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
   ip link set heltap0 master virbr0 && ip link set heltap0 up
   sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
     DISPLAY=${DISPLAY:-:0} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=${GDK_BACKEND:-wayland,x11,*} SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland} \
-    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
+    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_QEMU_RENDER_GPU="$QEMU_RENDER_GPU" HELIOS_INTEL_RENDER_NODE="$INTEL_RENDER_NODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
     HELIOS_KVMFR_SIZE="$KVMFR_SIZE" HELIOS_LG_CLIENT="$LG_CLIENT" \
     HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_DISPLAY_SERVER="$LG_DISPLAY_SERVER" HELIOS_LG_RENDERER="$LG_RENDERER" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
     HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_RESTART_CLIENT="$LG_RESTART_CLIENT" \
     HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" HELIOS_LG_CLIENT_LOG="$LG_CLIENT_LOG" \
-    HELIOS_INT_ACTION="$INT_ACTION" \
+    HELIOS_INT_ACTION="$INT_ACTION" HELIOS_SMP="$SMP" HELIOS_SOCKETS="$SOCKETS" HELIOS_CORES="$CORES" HELIOS_THREADS="$THREADS" \
     bash "$0" &
   USER_PHASE_PID=$!
   while kill -0 "$USER_PHASE_PID" 2>/dev/null; do
@@ -183,11 +203,29 @@ sleep 1
 
 qemu_display_args=(-display gtk,gl=on)
 qemu_lg_args=()
+qemu_env_prefix=(env)
 lg_client_args=()
 lg_client_env_prefix=(env)
+qemu_egl_headless=egl-headless
+
+if [ "$QEMU_RENDER_GPU" = "intel" ]; then
+  [ -e "$INTEL_RENDER_NODE" ] || { echo "missing Intel render node $INTEL_RENDER_NODE"; exit 1; }
+  qemu_env_prefix=(
+    env
+    __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+    __GLX_VENDOR_LIBRARY_NAME=mesa
+    DRI_PRIME=pci-0000_00_02_0
+    MESA_LOADER_DRIVER_OVERRIDE=iris
+  )
+  qemu_egl_headless="egl-headless,rendernode=$INTEL_RENDER_NODE"
+elif [ "$QEMU_RENDER_GPU" != "default" ]; then
+  echo "unknown HELIOS_QEMU_RENDER_GPU=$QEMU_RENDER_GPU (expected default or intel)"
+  exit 1
+fi
+
 if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   if [ "$LG_TRANSPORT" = "kvmfr" ]; then
-    qemu_display_args=(-display egl-headless)
+    qemu_display_args=(-display "$qemu_egl_headless")
     qemu_lg_args=(
       -spice port="$SPICE_PORT",addr=127.0.0.1,disable-ticketing=on,image-compression=off
       -chardev spicevmc,id=charchannel0,name=vdagent
@@ -207,7 +245,7 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
       win:disableWaitingMessage=yes
     )
   elif [ "$LG_TRANSPORT" = "spice" ]; then
-    qemu_display_args=(-display egl-headless)
+    qemu_display_args=(-display "$qemu_egl_headless")
     qemu_lg_args=(
       -spice port="$SPICE_PORT",addr=127.0.0.1,disable-ticketing=on,image-compression=off
       -chardev spicevmc,id=charchannel0,name=vdagent
@@ -232,6 +270,7 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   if [ "$LG_RENDER_GPU" = "intel" ]; then
     lg_client_env=(
       __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+      __GLX_VENDOR_LIBRARY_NAME=mesa
       DRI_PRIME=pci-0000_00_02_0
       MESA_LOADER_DRIVER_OVERRIDE=iris
     )
@@ -262,6 +301,9 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
 
   if [ "$LG_RENDERER" != "auto" ]; then
     lg_client_args+=(app:renderer="$LG_RENDERER")
+  fi
+  if [ "$LG_RENDERER" = "EGL" ]; then
+    lg_client_args+=(egl:multisample=no)
   fi
 
   if [ "$LG_START_CLIENT" = "yes" ]; then
@@ -297,8 +339,8 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   fi
 fi
 
-echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, native Wayland). Z:\\ = repo. SSH 192.168.122.120 <<<"
-setsid /usr/bin/qemu-system-x86_64 \
+echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. SSH 192.168.122.120 <<<"
+setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   -name \
   guest=win11,debug-threads=on \
   -blockdev \
@@ -310,7 +352,7 @@ setsid /usr/bin/qemu-system-x86_64 \
   -machine \
   pc-q35-11.0,usb=off,vmport=off,smm=on,dump-guest-core=off,memory-backend=pc.ram,pflash0=libvirt-pflash0-format,pflash1=libvirt-pflash1-storage,hpet=off,acpi=on \
   -accel \
-  kvm \
+  kvm,honor-guest-pat=on \
   -cpu \
   host,migratable=on,hv-time=on,hv-relaxed=on,hv-vapic=on,hv-spinlocks=0x1fff,hv-vpindex=on,hv-runtime=on,hv-synic=on,hv-stimer=on,hv-frequencies=on,hv-tlbflush=on,hv-ipi=on,hv-evmcs=on,hv-avic=on \
   -m \
@@ -320,7 +362,7 @@ setsid /usr/bin/qemu-system-x86_64 \
   -overcommit \
   mem-lock=off \
   -smp \
-  16,sockets=16,cores=1,threads=1 \
+  "$SMP,sockets=$SOCKETS,cores=$CORES,threads=$THREADS" \
   -uuid \
   bfe8dc1f-8c5b-435c-8045-1ef3a5c19053 \
   -no-user-config \
@@ -412,8 +454,6 @@ setsid /usr/bin/qemu-system-x86_64 \
   reset \
   -device \
   '{"driver":"virtio-balloon-pci","id":"balloon0","bus":"pci.4","addr":"0x0"}' \
-  -accel \
-  kvm,honor-guest-pat=on \
   -d \
   guest_errors \
   -sandbox \
