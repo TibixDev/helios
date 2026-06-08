@@ -2,6 +2,12 @@
 
 **Date:** 2026-06-07
 
+> **Update (2026-06-08):** the IDD experiment below was pursued through the vendored Looking Glass IDD. The direct
+> IDD-to-Helios/Venus scanout path was retired after black/grey output despite nonzero test-pattern frames. The
+> active desktop-output path is now the normal Looking Glass IDD producer with KVMFR/ivshmem transport. The IDD
+> capture path drops frames instead of blocking when D3D12 copy queues are saturated, and the IddCx 1.10 HDR/WCG
+> path now prefers 10 bpc. See [`LOOKING_GLASS_HELIOS_2026_06_08.md`](LOOKING_GLASS_HELIOS_2026_06_08.md).
+
 The System-class KMDF + Mesa Venus path is now the renderer baseline: `vkcube` renders normally, cached
 `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` memory is handled explicitly, and close-time ICD teardown assertions are
 fixed. The remaining visible frame drops while a Vulkan window updates are a display/composition problem, not a
@@ -102,13 +108,13 @@ pleasant. It is acceptable for smoke tests and driver installation, not for judg
 
 Do not move focus to a full WDDM render driver.
 
-Next, run a two-track plan:
+Current recommendation after the 2026-06-08 Looking Glass work:
 
-1. Keep System-class Helios as the renderer path and measure it with offscreen and controlled WSI workloads.
-2. Start a small IDD prototype as the first display experiment, because it can coexist with the current driver and
-   avoids kernel VidPN churn. The goal is to learn the Windows desktop frame cadence, copy/encode cost, and output
-   channel requirements.
-
-Only revive DOD after that if the product goal is specifically QEMU-native scanout through virtio-gpu/GTK/SPICE.
-If DOD comes back, scope it narrowly: display-only, ideally second virtio-gpu PCI function, with Venus kept on the
-existing System-class driver until the scanout path proves itself.
+1. Keep System-class Helios as the Vulkan renderer path and measure it with offscreen, WSI, and DXVK/vkd3d
+   workloads.
+2. Use Looking Glass IDD + KVMFR/ivshmem as the desktop-output path. Treat IDD capture drops separately from
+   Venus/KMD stalls when diagnosing visible hitches.
+3. Keep the direct IDD-to-Helios scanout bridge disabled unless it is deliberately revived as a new experiment.
+4. Only revive DOD if the product goal specifically becomes QEMU-native virtio-gpu scanout through GTK/SPICE. If
+   DOD comes back, scope it narrowly: display-only, ideally on a second virtio-gpu PCI function, with Venus kept on
+   the existing System-class driver until the scanout path proves itself.

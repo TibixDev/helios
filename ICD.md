@@ -414,8 +414,21 @@ Implement in this order (each enables more test coverage):
 - [ ] `vkCmdDrawIndexed` / `vkCmdDraw`
 - [ ] `vkCmdCopyBuffer` / `vkCmdCopyImage`
 
-### Tier 5: Presentation (deferred — headless-first)
-Helios is **headless-first**: `vulkaninfo` and offscreen `vkcube` need no WSI/swapchain at all, so this tier is deferred. There is no WDDM Present path to fall back to (the KMD is not a display driver). If windowed presentation is ever required, it is a **GDI `StretchDIBits` readback** from a mapped host-visible blob into a window DC (the mvisor pattern) — the ICD reads the rendered image out of a `MAP_BLOB` user VA and blits it — NOT a swapchain/`vkQueuePresentKHR` flip through a display driver.
+### Tier 5: Presentation (Win32 WSI through Mesa Venus)
+The active ICD is Mesa Venus with Helios' `vn_renderer_helios.c` backend, and Win32 WSI is now functional enough
+for `vkcube` on the System-class KMDF path. This is still **application WSI**, not a WDDM desktop present path:
+the Helios KMD is not a display miniport and does not participate in DWM/DXGI scanout ownership. Looking Glass IDD
++ KVMFR/ivshmem is the current desktop-output path.
+
+Recent caveats:
+
+- `HOST_VISIBLE|HOST_COHERENT` behavior is implemented with cached coherent mappings and explicit renderer-side
+  synchronization; do not reintroduce the old Venus fence-shortcut patches that marked submits complete before
+  their host fence retired.
+- Sync values are retired only after `IOCTL_HELIOS_WAIT_FENCE` confirms the corresponding fence. This avoids WSI
+  observing a render/present sync as complete while an older host frame can still surface.
+- Windowed WSI performance should be measured separately from Looking Glass IDD capture/export stalls. A hitch in
+  the displayed desktop can come from either Venus/KMD waits or the IDD/KVMFR copy path.
 
 ---
 
@@ -425,7 +438,7 @@ Venus supports a large set of Vulkan extensions. Expose the ones DXVK requires:
 
 **Minimum for DXVK 2.x:**
 ```
-VK_KHR_swapchain (may be optional — headless-first, no WSI)
+VK_KHR_swapchain (needed for Win32 WSI / vkcube-style windowed presentation)
 VK_KHR_maintenance1/2/3/4
 VK_KHR_shader_draw_parameters
 VK_EXT_vertex_attribute_divisor
