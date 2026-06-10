@@ -457,13 +457,49 @@ Recent caveats:
 - After switching the GDI fallback to DIB-shadow + `BitBlt`, `HELIOS_LG_DIRECT=0` has measured roughly as fast as
   `HELIOS_LG_DIRECT=1`. Keep both paths for now while testing, but the direct Looking Glass producer path is no
   longer assumed to be a required performance path and can be removed if it continues to show no benefit.
-- Host renderer choice is now a first-order test variable. On this machine, NVIDIA-backed virglrenderer/Venus made
-  Doom 2016 show black/white frames and could corrupt/freeze the Linux host desktop. Intel-backed Venus is correct
-  enough to play Doom, but slower. Keep Intel as the default correctness baseline until the NVIDIA path is isolated
-  and fixed.
-- Do not carry NVIDIA-specific ICD workarounds in Helios. The observed host-side lockups match current NVIDIA
-  Blackwell/Xid 109 reports; keep Helios close to Linux Venus behavior and treat NVIDIA renderer tests as a host
-  driver risk until upstream changes.
+- **NVIDIA host renderer: root cause found and fixed (2026-06-10).** The Doom-on-NVIDIA white screen (working only
+  early after host boot, escalating to Xid 31 `FAULT_UNSUPPORTED_APERTURE` GPU faults and Xid 13 FECS fatals) was
+  spec-violating Venus behavior that ANV tolerates and NVIDIA does not: vkr force-exports every HOST_VISIBLE
+  allocation (`VkExportMemoryAllocateInfo`, dma_buf on NVIDIA 610), while venus created buffers/images with no
+  matching `VkExternalMemoryBufferCreateInfo`/`ImageCreateInfo` — every host-visible bind violated VUID 02726/02728
+  (this hole exists upstream too). A second bug created WSI swapchain command pools on queue families never enabled
+  on the logical device (VUID 01937; NVIDIA exposes 5–6 families vs Intel's 1–2). Both fixed in `icd/mesa`
+  (`venus: match vkr's force-export external memory…`, `wsi: only create swapchain cmd pools…`); found via
+  host-side validation layers in the render server (`HELIOS_VKR_DEBUG=validate`, log tee'd to
+  `/tmp/helios-qemu-stderr.log` by the launcher). Doom 2016 now renders correctly at 120+ fps on the NVIDIA host.
+  Known accepted residue: a LINEAR+PREINITIALIZED app image (e.g. vkcube's staging texture) legally cannot carry
+  external info (VUID 01443) and keeps the upstream bind mismatch.
+- The Xid 13 "Graphics FECS Exception: UCODE Fatal Error" host freeze is a known unrecoverable NVIDIA Blackwell
+  GB202 firmware defect (open-gpu-kernel-modules#1080: GSP halts by design on a detected ctx-switch hang); never
+  leave a broken-rendering run sitting, and keep the host compositor on the Intel iGPU during NVIDIA experiments.
+
+### Performance improvement candidates (2026-06-10, NVIDIA baseline 120+ fps)
+
+Ordered by expected payoff; measure with `HELIOS_PERF=1` + `HELIOS_WSI_PERF=1` before/after each.
+
+1. **Re-measure clean.** The 120 fps figure was taken with `HELIOS_VKR_DEBUG=validate` active (host-side validation
+   layers in the render server are expensive). Unset it — and make sure `VN_PERF=no_multi_ring` (a removed
+   diagnostic artifact) is not set — before reading any number.
+2. **Coherent-cached clflush sweeps.** `vn_device_memory_flush/invalidate_coherent_cached_mappings` cache-op the
+   FULL mapped range of every registered HOST_CACHED mapping on every `vkQueueSubmit` and every successful
+   fence/semaphore wait — O(total mapped bytes) each time. Candidates: dirty-range tracking; skipping the op
+   entirely when guest mapping and host `map_info` are both CACHED (KVM with `honor-guest-pat=on` is already
+   coherent for host-WB memory); registering only memories the WSI/GDI path actually reads.
+3. **KMD `quiesce_into` bubbles.** Every synchronous control-queue op (ALLOC_BLOB / MAP_BLOB / RELEASE_BLOB) drains
+   all in-flight fenced submits first. Doom streams allocations during gameplay, so each one is a pipeline stall.
+   Candidate: quiesce only what the op actually orders against (e.g. the blob's own mem-alloc batch), not the world.
+4. **`helios_wait` slow path.** Issues one `IOCTL_HELIOS_WAIT_FENCE` per pending fence, sequentially, each granted
+   the full timeout. Batch into one IOCTL taking a fence list, or wait only the max fence per ring (virtio fences
+   retire in order per ring). Longer term: a shared fence page mapped user-mode would make fence polls syscall-free.
+5. **Present copy path.** Each present is a full-frame CPU copy (Venus image → DIB shadow or KVMFR slot). Dirty-rect
+   tracking in the WSI copy, and skipping the GDI shadow entirely while the Looking Glass direct producer is active,
+   are both unexplored.
+6. **External-info injection cost.** All buffers now carry the renderer handle type; if NVIDIA penalizes external
+   allocations (alignment padding showed up in vkr's opaque-fd path), a refinement is injecting only for buffers
+   whose usage can plausibly bind host-visible memory. Only worth doing if profiling shows it.
+7. **Default render node.** The launcher still defaults QEMU/Venus to Intel (`HELIOS_QEMU_RENDER_GPU=intel`,
+   40–45 fps). After a stability soak on NVIDIA (multiple late-uptime sessions without Xid), flipping the default
+   is a free 3x.
 - WDDM/DXGI remains a possible future escape hatch, not the next default step. It would require a real WDDM render
   adapter path rather than only the current System-class DeviceIoControl KMD, and it would not by itself implement
   D3D12. Optimize and measure the current Venus path first.

@@ -37,7 +37,7 @@
 set -uo pipefail
 
 if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
-  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_RENDER_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
+  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_QEMU_RENDER_GPU,HELIOS_INTEL_RENDER_NODE,HELIOS_NVIDIA_RENDER_NODE,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,HELIOS_SMP,HELIOS_SOCKETS,HELIOS_CORES,HELIOS_THREADS,HELIOS_VKR_DEBUG,HELIOS_QEMU_LOG,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
     bash "$0" "$@"
 fi
 
@@ -114,6 +114,7 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
     HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_RESTART_CLIENT="$LG_RESTART_CLIENT" \
     HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" HELIOS_LG_CLIENT_LOG="$LG_CLIENT_LOG" \
     HELIOS_INT_ACTION="$INT_ACTION" HELIOS_SMP="$SMP" HELIOS_SOCKETS="$SOCKETS" HELIOS_CORES="$CORES" HELIOS_THREADS="$THREADS" \
+    HELIOS_VKR_DEBUG="${HELIOS_VKR_DEBUG:-}" HELIOS_QEMU_LOG="${HELIOS_QEMU_LOG:-}" \
     bash "$0" &
   USER_PHASE_PID=$!
   while kill -0 "$USER_PHASE_PID" 2>/dev/null; do
@@ -362,6 +363,16 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
 fi
 
 echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. SSH 192.168.122.120 <<<"
+# Capture QEMU + virgl_render_server (vkr_log) stderr; render-server diagnostics
+# like "failed to look up object" / "mem fd export failed" land here. Optional
+# HELIOS_VKR_DEBUG (e.g. "validate" / "all") enables vkr debugging incl. host-side
+# Vulkan validation layers in the render server.
+QEMU_LOG="${HELIOS_QEMU_LOG:-/tmp/helios-qemu-stderr.log}"
+: >"$QEMU_LOG"
+echo ">>> QEMU/render-server stderr tee'd to $QEMU_LOG <<<"
+if [ -n "${HELIOS_VKR_DEBUG:-}" ]; then
+  qemu_env_prefix+=("VKR_DEBUG=${HELIOS_VKR_DEBUG}")
+fi
 setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   -name \
   guest=win11,debug-threads=on \
@@ -469,7 +480,7 @@ setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   -device \
   '{"driver":"usb-tablet","id":"input2","bus":"usb.0","port":"1"}' \
   -device \
-  '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":4294967296,"max_hostmem":4294967296}' \
+  '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":8589934592,"max_hostmem":8589934592}' \
   -global \
   ICH9-LPC.noreboot=off \
   -watchdog-action \
@@ -482,7 +493,7 @@ setsid "${qemu_env_prefix[@]}" /usr/bin/qemu-system-x86_64 \
   off \
   -msg \
   timestamp=on \
-  "${qemu_display_args[@]}" &
+  "${qemu_display_args[@]}" 2> >(tee -a "$QEMU_LOG" >&2) &
 QEMU_PID=$!
 while kill -0 "$QEMU_PID" 2>/dev/null; do
   if [ -n "${LG_CLIENT_PID:-}" ] && ! kill -0 "$LG_CLIENT_PID" 2>/dev/null; then
