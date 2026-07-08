@@ -1,15 +1,18 @@
-# Build artifacts — Linux and Windows MUST use separate target dirs.
+# Build artifacts - Linux and Windows MUST use separate target dirs.
 # See CLAUDE.md: CARGO_TARGET_DIR=target/linux (Linux) / target/windows (Windows).
+# (target/ already covers the WDK's target/<profile>/package/ output.)
 /target
 /**/target
 target/
 
-# WDK / driver packaging output
+# WDK / driver signing artifacts
 *.sys
 *.pdb
 *.cat
 *.cer
-/**/package/
+
+# Assembled driver packages (tools/package/make-package.sh output)
+/dist/
 
 # Editor / OS cruft
 *.swp

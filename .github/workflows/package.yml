@@ -1,0 +1,167 @@
+name: package
+
+# Build the Helios vGPU guest driver package (KMD .sys/.inf + Mesa Venus ICD)
+# end-to-end on GitHub-hosted Windows runners and publish a ready-to-install zip.
+#
+# NOTE ON SCOPE: this builds and PACKAGES only. It cannot boot the driver - a
+# GitHub Windows runner is not a KVM guest with a virtio-gpu device and no Venus
+# host behind it. Functional verification (device binds, vulkaninfo enumerates
+# the host GPU) happens on the local Helios VM via tools/package/make-package.sh
+# and the manual smoke tests. Treat green CI as "it builds + packages", not
+# "it works on hardware".
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kmd:
+    name: Build KMD (.sys + .inf)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly + rust-src + the msvc target.
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Install cargo-make
+        run: cargo install --locked cargo-make
+
+      # LLVM 17 for bindgen (windows-drivers-rs wants libclang; 18 has a bindgen
+      # bug per TOOLCHAIN.md). The WDK + SDK 10.0.26100 ship on windows-2022.
+      - name: Install LLVM 17
+        run: choco install llvm --version=17.0.6 -y --no-progress
+
+      - name: Locate WDK/SDK
+        shell: pwsh
+        run: |
+          $kit = 'C:\Program Files (x86)\Windows Kits\10'
+          $ver = (Get-ChildItem "$kit\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
+          "Using kit $ver"
+          if (-not (Test-Path "$kit\Include\$ver\shared\specstrings.h")) {
+            throw "incomplete WDK/SDK kit $ver (no specstrings.h) - bindgen will fail"
+          }
+
+      - name: Build + package driver
+        shell: pwsh
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          cd kmd
+          cargo make --makefile Cargo.make.toml
+          $pkg = 'target\debug\helios_kmd_package'
+          if (-not (Test-Path "$pkg\helios_kmd.sys")) { throw "no .sys produced" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmd-package
+          path: kmd/target/debug/helios_kmd_package/
+          if-no-files-found: error
+
+  icd:
+    name: Build Mesa Venus ICD (vulkan_virtio.dll)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps (mingw, meson, ninja, python)
+        shell: pwsh
+        run: |
+          choco install mingw --version=13.2.0 -y --no-progress
+          python -m pip install --quiet meson ninja mako pyyaml packaging
+
+      # Meson's realpath chokes on some overlay filesystems; on the runner the
+      # checkout is a normal NTFS path so we configure in-tree. The forced-include
+      # shim (helios_win_compat.h) is what lets venus compile on Windows.
+      - name: Configure
+        shell: pwsh
+        run: |
+          $inc = "$PWD\icd\win-build\helios_win_compat.h"
+          meson setup build-icd icd\mesa `
+            "-Dc_args=-include$inc" `
+            -Dvulkan-drivers=virtio -Dgallium-drivers= -Dplatforms=windows `
+            -Dvideo-codecs= -Dvulkan-layers= -Degl=disabled -Dgbm=disabled `
+            -Dglx=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled `
+            -Dllvm=disabled -Dshader-cache=disabled -Dbuild-tests=false `
+            -Dperfetto=false --buildtype=debugoptimized
+
+      - name: Compile
+        run: meson compile -C build-icd
+
+      - name: Collect ICD
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem build-icd -Recurse -Filter vulkan_virtio.dll | Select-Object -First 1
+          if (-not $dll) { throw "vulkan_virtio.dll not built" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $dll.FullName out\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: icd-build
+          path: out/
+          if-no-files-found: error
+
+  package:
+    name: Assemble release zip
+    needs: [kmd, icd]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: kmd-package, path: dl/kmd }
+      - uses: actions/download-artifact@v4
+        with: { name: icd-build,  path: dl/icd }
+
+      - name: Stage package
+        id: stage
+        shell: pwsh
+        run: |
+          $sha = "$env:GITHUB_SHA".Substring(0,7)
+          $ver = if ("$env:GITHUB_REF" -like 'refs/tags/*') { "$env:GITHUB_REF_NAME" } else { "0.1.0+$sha" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          $stage = "helios-vgpu-$ver"
+          New-Item -ItemType Directory -Force "$stage\driver","$stage\icd" | Out-Null
+
+          Copy-Item dl\kmd\* "$stage\driver\" -Recurse -Force
+          # Hash-version the ICD DLL and write a matching Khronos manifest so the
+          # installer just copies + registers (mirrors install-helios-icd.ps1).
+          $dll = Get-ChildItem dl\icd -Filter vulkan_virtio.dll | Select-Object -First 1
+          $hash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash.Substring(0,12).ToLower()
+          $dllName = "vulkan_virtio-$hash.dll"
+          Copy-Item $dll.FullName "$stage\icd\$dllName"
+          @{
+            file_format_version = '1.0.1'
+            ICD = @{ library_path = $dllName; library_arch = '64'; api_version = '1.4.0' }
+          } | ConvertTo-Json | Set-Content "$stage\icd\virtio_devenv_icd.x86_64.json"
+
+          Copy-Item tools\package\install.ps1,tools\package\uninstall.ps1,tools\package\README.md "$stage\"
+          @{
+            version = $ver; commit = "$env:GITHUB_SHA"
+            built = (Get-Date -Format o); runner = 'github-windows-2022'
+          } | ConvertTo-Json | Set-Content "$stage\versions.json"
+
+          Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip" -Force
+          "zip=$stage.zip" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helios-vgpu-package
+          path: ${{ steps.stage.outputs.zip }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.stage.outputs.zip }}
