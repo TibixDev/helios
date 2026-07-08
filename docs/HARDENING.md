@@ -32,13 +32,24 @@ Sequencing rule: **H3 and H4 must be fixed before H5** — opening the device AC
   serializes all IOCTLs and blocks preemption for up to the poll budget. Restructure
   so the lock guards only ring manipulation and the wait happens at PASSIVE.
 
-## Non-admin enablement (bundle: H3 + H4, then H5)
+## Multi-client / untrusted-access hardening
+
+> **CORRECTION (2026-07-08): the device is already reachable by non-admin
+> callers.** H5 below assumed the default ACL was admin-only; a LIMITED-token
+> (filtered-admin / medium-integrity) probe and a double-clicked vkcube both open
+> `GUID_DEVINTERFACE_HELIOS` and run IOCTLs fine. So untrusted local code can hit
+> the driver *today* — which makes H3 a live unprivileged bugcheck vector (not a
+> "before we open the ACL" nicety) and made H4 a live cross-tenant hole (now
+> fixed), and means H5 needs no work to *enable* non-admin (only, optionally, to
+> *tighten* it).
 
 - [ ] **H3 — uncatchable SEH on `MmMapLockedPagesSpecifyCache(UserMode)`**
   (`ioctl.rs`). Raises a structured exception on VA/quota exhaustion; `no_std`
-  has no SEH, so it bugchecks. The 256 MiB size cap does not prevent it. Fix: a C
-  `__try/__except` shim that returns NULL on raise (makes the existing `is_null`
-  branch live). Mandatory before H5.
+  has no SEH, so it bugchecks. The 256 MiB size cap does not prevent it. **Now
+  higher priority:** reachable by any non-admin process (see correction above), so
+  it is a live local denial-of-service (unprivileged app can bugcheck the host).
+  Fix: a C `__try/__except` shim that returns NULL on raise (makes the existing
+  `is_null` branch live).
 
 - [x] ~~**H4 — `MAP_BLOB` has no owner/ctx authorization**~~ Fixed:
   `map_blob_prepare` now authorizes by the **calling file object** — it looks up
@@ -49,11 +60,16 @@ Sequencing rule: **H3 and H4 must be fixed before H5** — opening the device AC
   Verified on the VM: the in-process ICD map path still works (`helios_vk_dev`
   PASS: vkMapMemory round-trip + readback). (commit)
 
-- [ ] **H5 — device ACL is admin/SYSTEM only** (no SDDL, `pnp.rs`). Non-admin
-  RDP-session apps get `ACCESS_DENIED`. Fix (only after H3 + H4): assign a
-  validated SDDL granting interactive users. Validate offline with
-  `ConvertStringSecurityDescriptorToSecurityDescriptor` (the prior attempt failed
-  with an invalid descriptor, Code 31).
+- [~] **H5 — device ACL — REVIEW FINDING WAS WRONG.** The claim "admin/SYSTEM
+  only, non-admin gets ACCESS_DENIED" is **disproved** empirically: a LIMITED-token
+  probe and a non-elevated vkcube both open the device and run IOCTLs. No SDDL is
+  set, but the WDF default already permits non-admin access — so nothing is needed
+  to *enable* the WinBoat non-admin path. Remaining OPTIONAL hardening: decide
+  whether the default is *too* open (e.g. should low-integrity / AppContainer /
+  sandboxed callers be denied?) and, if so, assign a deliberately-scoped SDDL
+  (validate offline with `ConvertStringSecurityDescriptorToSecurityDescriptor`;
+  the prior code attempt failed with an invalid descriptor, Code 31). Not a
+  blocker — a policy choice.
 
 ## Cleanup (low)
 
