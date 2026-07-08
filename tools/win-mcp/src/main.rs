@@ -1,4 +1,4 @@
-//! win-mcp — a local stdio MCP server that runs commands and cargo/cargo-make
+//! win-mcp - a local stdio MCP server that runs commands and cargo/cargo-make
 //! builds on the Helios `win11` dev VM over SSH.
 //!
 //! Why this exists: raw `ssh win "..."` from the agent suffers from cmd.exe
@@ -8,7 +8,7 @@
 //! propagates the real exit code.
 //!
 //! Runs on Linux (the agent's host); the win11 project tree is shared at `Z:\`,
-//! so no file tools are needed — the agent edits files directly on the Linux
+//! so no file tools are needed - the agent edits files directly on the Linux
 //! side of the share.
 
 use std::collections::HashMap;
@@ -28,23 +28,57 @@ use tokio::process::Command;
 
 /// Shared project root on the Windows side (the Z: drive maps the Linux tree).
 const PROJECT_DRIVE: &str = "Z:\\";
+/// libclang location for bindgen (set as LIBCLANG_PATH for cargo builds).
+const LIBCLANG_PATH: &str = "C:\\Program Files\\LLVM\\bin";
+
+/// Read an env override for a VM-specific setting, falling back to the
+/// original dev-VM default. Empty values count as unset.
+fn env_or(var: &str, default: String) -> String {
+    std::env::var(var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or(default)
+}
+
+/// Windows account name on the dev VM - anchors every C:\Users\<user> build
+/// path below. Override with HELIOS_WIN_USER when the guest uses a different
+/// username than the original dev VM.
+fn win_user() -> String {
+    env_or("HELIOS_WIN_USER", "Rupansh".to_string())
+}
+
+/// SSH host alias for the dev VM (from ~/.ssh/config).
+/// Override: HELIOS_WIN_SSH_HOST.
+fn ssh_host() -> String {
+    env_or("HELIOS_WIN_SSH_HOST", "win".to_string())
+}
+
 /// Local build mirror. cargo/wdk build IO fails on the Z:\ 9p share (OS error 87,
 /// see windows-drivers-rs#481), so win_cargo robocopy-syncs here and builds on
 /// local disk. Edit sources on Linux/Z:\; the mirror is re-synced each build.
-const MIRROR_ROOT: &str = "C:\\Users\\Rupansh\\helios-vgpu";
-/// libclang location for bindgen (set as LIBCLANG_PATH for cargo builds).
-const LIBCLANG_PATH: &str = "C:\\Program Files\\LLVM\\bin";
-/// SSH host alias for the dev VM (from ~/.ssh/config).
-const SSH_HOST: &str = "win";
+/// Override: HELIOS_WIN_MIRROR_ROOT.
+fn mirror_root() -> String {
+    env_or(
+        "HELIOS_WIN_MIRROR_ROOT",
+        format!("C:\\Users\\{}\\helios-vgpu", win_user()),
+    )
+}
 
-/// Mesa venus ICD source — the vendored submodule, on the share. meson/ninja/cl
+/// Mesa venus ICD source - the vendored submodule, on the share. meson/ninja/cl
 /// read source straight from here: building Mesa does NOT need the robocopy mirror
-/// (validated — meson configures and cl compiles from Z:\ to a local C: build dir;
+/// (validated - meson configures and cl compiles from Z:\ to a local C: build dir;
 /// the 9p share is fine for the compiler's READS, unlike cargo/wdk artifact writes).
 /// So `win_cargo` EXCLUDES this path from its mirror and Mesa is built via `win_meson`.
 const MESA_SRC: &str = "Z:\\icd\\mesa";
+
 /// Local build dir for the Mesa venus ICD (ninja writes artifacts to local disk).
-const MESA_BUILD: &str = "C:\\Users\\Rupansh\\helios-mesa-build";
+/// Override: HELIOS_WIN_MESA_BUILD.
+fn mesa_build_dir() -> String {
+    env_or(
+        "HELIOS_WIN_MESA_BUILD",
+        format!("C:\\Users\\{}\\helios-mesa-build", win_user()),
+    )
+}
 /// VS 2022 x64 dev environment (vcvars). Kept for the clang-cl ALTERNATIVE
 /// toolchain (icd/win-build/clang-cl-native.ini), which needs the MSVC SDK libs;
 /// the recommended mingw build does not use it. Drive clang-cl manually via
@@ -52,10 +86,19 @@ const MESA_BUILD: &str = "C:\\Users\\Rupansh\\helios-mesa-build";
 #[allow(dead_code)]
 const VCVARS: &str =
     "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat";
-/// mingw-w64 (WinLibs UCRT gcc 16.1) bin dir — the RECOMMENDED venus toolchain
+/// mingw-w64 (WinLibs UCRT gcc 16.1) bin dir - the RECOMMENDED venus toolchain
 /// (icd/win-build/mingw-native.ini). gcc compiles venus's GNU-isms natively and
 /// builds straight from Z:\. Installed via `winget install BrechtSanders.WinLibs.POSIX.UCRT`.
-const MINGW_BIN: &str = "C:\\Users\\Rupansh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\\mingw64\\bin";
+/// Override: HELIOS_WIN_MINGW_BIN (the winget package path embeds the username).
+fn mingw_bin() -> String {
+    env_or(
+        "HELIOS_WIN_MINGW_BIN",
+        format!(
+            "C:\\Users\\{}\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\\mingw64\\bin",
+            win_user()
+        ),
+    )
+}
 /// MSBuild used for Looking Glass IDD's WDK/Visual Studio solution.
 const MSBUILD: &str =
     "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Msbuild\\Current\\Bin\\MSBuild.exe";
@@ -158,7 +201,7 @@ async fn run_ssh(
     let encoded = encode_powershell(&script);
 
     let mut cmd = Command::new("ssh");
-    cmd.arg(SSH_HOST)
+    cmd.arg(ssh_host())
         .arg("powershell")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -221,10 +264,11 @@ struct WinCargoArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct WinMesonArgs {
-    /// meson argv to run under the VS dev environment. Examples:
-    ///   ["setup", "C:\\Users\\Rupansh\\helios-mesa-build", "Z:\\icd\\mesa",
+    /// meson argv to run under the VS dev environment. Use the {MESA_BUILD}
+    /// placeholder for the build dir; it expands to the configured path. Examples:
+    ///   ["setup", "{MESA_BUILD}", "Z:\\icd\\mesa",
     ///    "-Dvulkan-drivers=virtio", "-Dgallium-drivers=", "-Dplatforms=windows", ...]
-    ///   ["compile", "-C", "C:\\Users\\Rupansh\\helios-mesa-build"]
+    ///   ["compile", "-C", "{MESA_BUILD}"]
     /// Empty defaults to `compile -C <the standard Mesa build dir>`. Args must be
     /// space-free or pre-quoted (they are joined verbatim).
     #[serde(default)]
@@ -249,7 +293,8 @@ struct WinLookingGlassArgs {
     #[serde(default)]
     build_args: Vec<String>,
     /// Build directory on the Windows VM. Defaults to
-    /// C:\Users\Rupansh\helios-lookingglass-host-build.
+    /// C:\Users\<HELIOS_WIN_USER>\helios-lookingglass-host-build
+    /// (override: HELIOS_WIN_LG_BUILD).
     #[serde(default)]
     build_dir: Option<String>,
     /// If true, skip CMake configure and only run the build step.
@@ -328,7 +373,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target/, all .git, and the vendored Mesa submodule at icd/mesa — Mesa is a meson/C ICD built separately via win_meson straight from the share, not through this mirror) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd\"); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
+        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> the local mirror (default C:\\Users\\<HELIOS_WIN_USER>\\helios-vgpu; env-overridable) (excluding target/, all .git, and the vendored Mesa submodule at icd/mesa - Mesa is a meson/C ICD built separately via win_meson straight from the share, not through this mirror) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side - the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd\"); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
     )]
     async fn win_cargo(&self, Parameters(a): Parameters<WinCargoArgs>) -> String {
         let mut env = HashMap::new();
@@ -341,11 +386,12 @@ impl WinHost {
         // .git/modules/icd/mesa), AND the whole vendored Mesa tree at MESA_SRC. Mesa
         // is a meson/C ICD, never a cargo build, so it has no business in this mirror;
         // excluding it keeps every kmd/probe build fast. Mesa is built separately,
-        // straight from the share, via `win_meson` (no robocopy — validated).
+        // straight from the share, via `win_meson` (no robocopy - validated).
+        let mirror_root = mirror_root();
         let command = format!(
-            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XD target .git \"{MESA_SRC}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+            "robocopy {PROJECT_DRIVE} {mirror_root} /MIR /XD target .git \"{MESA_SRC}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
              if ($LASTEXITCODE -ge 8) {{ \"win_cargo: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
-             Set-Location -LiteralPath '{MIRROR_ROOT}\\{}'\n\
+             Set-Location -LiteralPath '{mirror_root}\\{}'\n\
              cargo {}",
             a.crate_dir,
             a.args.join(" "),
@@ -357,22 +403,26 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Build the Mesa venus Vulkan ICD on win11 with the RECOMMENDED mingw-w64 gcc toolchain. Mesa is read straight from the Z:\\ share at Z:\\icd\\mesa and built into the LOCAL dir C:\\Users\\Rupansh\\helios-mesa-build (validated: gcc compiles 100% of venus from Z:\\ to link, zero Mesa edits). `args` is the meson argv. To CONFIGURE, pass the native file + the compat forced-include + the option set, e.g.: [\"setup\",\"C:\\\\Users\\\\Rupansh\\\\helios-mesa-build\",\"Z:\\\\icd\\\\mesa\",\"--native-file\",\"Z:\\\\icd\\\\win-build\\\\mingw-native.ini\",\"-Dc_args=-includeZ:\\\\icd\\\\win-build\\\\helios_win_compat.h\",\"-Dvulkan-drivers=virtio\",\"-Dgallium-drivers=\",\"-Dplatforms=windows\",\"-Dvideo-codecs=\",\"-Dvulkan-layers=\",\"-Degl=disabled\",\"-Dgbm=disabled\",\"-Dglx=disabled\",\"-Dopengl=false\",\"-Dgles1=disabled\",\"-Dgles2=disabled\",\"-Dllvm=disabled\",\"-Dshader-cache=disabled\",\"-Dbuild-tests=false\",\"-Dperfetto=false\",\"--buildtype=debugoptimized\"]. To BUILD, [\"compile\",\"-C\",\"C:\\\\Users\\\\Rupansh\\\\helios-mesa-build\"]; empty args defaults to compiling that dir. The mingw bin is prepended to PATH; no vcvars (mingw is self-contained). The clang-cl alternative (icd/win-build/clang-cl-native.ini) needs a local C: source mirror — drive it via win_exec. See icd/PHASE5_HANDOVER.md §6."
+        description = "Build the Mesa venus Vulkan ICD on win11 with the RECOMMENDED mingw-w64 gcc toolchain. Mesa is read straight from the Z:\\ share at Z:\\icd\\mesa and built into a LOCAL build dir (default C:\\Users\\<HELIOS_WIN_USER>\\helios-mesa-build; write it as the literal placeholder {MESA_BUILD} in args - the tool expands it) (validated: gcc compiles 100% of venus from Z:\\ to link, zero Mesa edits). `args` is the meson argv. To CONFIGURE, pass the native file + the compat forced-include + the option set, e.g.: [\"setup\",\"{MESA_BUILD}\",\"Z:\\\\icd\\\\mesa\",\"--native-file\",\"Z:\\\\icd\\\\win-build\\\\mingw-native.ini\",\"-Dc_args=-includeZ:\\\\icd\\\\win-build\\\\helios_win_compat.h\",\"-Dvulkan-drivers=virtio\",\"-Dgallium-drivers=\",\"-Dplatforms=windows\",\"-Dvideo-codecs=\",\"-Dvulkan-layers=\",\"-Degl=disabled\",\"-Dgbm=disabled\",\"-Dglx=disabled\",\"-Dopengl=false\",\"-Dgles1=disabled\",\"-Dgles2=disabled\",\"-Dllvm=disabled\",\"-Dshader-cache=disabled\",\"-Dbuild-tests=false\",\"-Dperfetto=false\",\"--buildtype=debugoptimized\"]. To BUILD, [\"compile\",\"-C\",\"{MESA_BUILD}\"]; empty args defaults to compiling that dir. The mingw bin is prepended to PATH; no vcvars (mingw is self-contained). The clang-cl alternative (icd/win-build/clang-cl-native.ini) needs a local C: source mirror - drive it via win_exec. See icd/PHASE5_HANDOVER.md §6."
     )]
     async fn win_meson(&self, Parameters(a): Parameters<WinMesonArgs>) -> String {
-        // Default to compiling the standard Mesa ICD build dir.
+        let mesa_build = mesa_build_dir();
+        // Default to compiling the standard Mesa ICD build dir. The {MESA_BUILD}
+        // placeholder in caller args expands to the configured build dir so
+        // callers never hardcode the VM username.
         let meson_args = if a.args.is_empty() {
-            format!("compile -C {MESA_BUILD}")
+            format!("compile -C {mesa_build}")
         } else {
-            a.args.join(" ")
+            a.args.join(" ").replace("{MESA_BUILD}", &mesa_build)
         };
         // Recommended toolchain = mingw-w64 gcc: prepend its bin to PATH so gcc +
         // its helpers resolve (the --native-file the caller passes pins the actual
-        // compilers). No vcvars — mingw ships its own Windows headers/libs and gcc
+        // compilers). No vcvars - mingw ships its own Windows headers/libs and gcc
         // ignores the MSVC INCLUDE/LIB env. meson reads Mesa source from Z:\ directly
         // (no robocopy); ninja artifacts go to the local C: build dir. cmd expands
         // %PATH% at parse time, which is correct here (single prepend, no prior env mutation).
-        let command = format!("cmd /c 'set \"PATH={MINGW_BIN};%PATH%\" && meson {meson_args}'");
+        let mingw_bin = mingw_bin();
+        let command = format!("cmd /c 'set \"PATH={mingw_bin};%PATH%\" && meson {meson_args}'");
         match run_ssh(
             &command,
             None,
@@ -387,14 +437,18 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Sync the project to the local Windows mirror and build the Looking Glass Windows host server from LookingGlass\\host. This mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu with robocopy (excluding target/, all .git dirs, and icd\\mesa), then builds from local disk into C:\\Users\\Rupansh\\helios-lookingglass-host-build using mingw-w64 gcc + Ninja. Edit sources on the Linux/Z:\\ side; the mirror is re-synced on every call. Empty args configure with Ninja RelWithDebInfo USE_NVFBC=OFF and build the default target."
+        description = "Sync the project to the local Windows mirror and build the Looking Glass Windows host server from LookingGlass\\host. This mirrors Z:\\ -> the local mirror (HELIOS_WIN_USER-derived) with robocopy (excluding target/, all .git dirs, and icd\\mesa), then builds from local disk into the HELIOS_WIN_USER-derived Looking Glass build dir using mingw-w64 gcc + Ninja. Edit sources on the Linux/Z:\\ side; the mirror is re-synced on every call. Empty args configure with Ninja RelWithDebInfo USE_NVFBC=OFF and build the default target."
     )]
     async fn win_looking_glass(&self, Parameters(a): Parameters<WinLookingGlassArgs>) -> String {
         let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
-        let build_dir = a
-            .build_dir
-            .unwrap_or_else(|| "C:\\Users\\Rupansh\\helios-lookingglass-host-build".to_string());
-        let lg_src = format!("{MIRROR_ROOT}\\LookingGlass\\host");
+        let build_dir = a.build_dir.unwrap_or_else(|| {
+            env_or(
+                "HELIOS_WIN_LG_BUILD",
+                format!("C:\\Users\\{}\\helios-lookingglass-host-build", win_user()),
+            )
+        });
+        let mirror_root = mirror_root();
+        let lg_src = format!("{mirror_root}\\LookingGlass\\host");
 
         let configure = if a.no_configure {
             String::new()
@@ -415,12 +469,13 @@ impl WinHost {
         };
         let mesa_exclude = mesa_exclude_for_source(&source_root);
 
+        let mingw_bin = mingw_bin();
         let command = format!(
             "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass: source root not found: {source_root}\"; exit 3 }}\n\
-             robocopy \"{source_root}\" {MIRROR_ROOT} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+             robocopy \"{source_root}\" {mirror_root} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
              if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
-             if (!(Test-Path -LiteralPath '{MIRROR_ROOT}\\LookingGlass\\host')) {{ \"win_looking_glass: LookingGlass\\host missing after sync\"; exit 2 }}\n\
-             $env:PATH = '{MINGW_BIN};' + $env:PATH\n\
+             if (!(Test-Path -LiteralPath '{mirror_root}\\LookingGlass\\host')) {{ \"win_looking_glass: LookingGlass\\host missing after sync\"; exit 2 }}\n\
+             $env:PATH = '{mingw_bin};' + $env:PATH\n\
              {}\n\
              if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n\
              {}\n",
@@ -446,7 +501,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Sync the project to the local Windows mirror and build the Looking Glass IDD WDK driver from LookingGlass\\idd\\LGIdd.sln. This mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu with robocopy (excluding target/, all .git dirs, and icd\\mesa), copies only icd\\mesa\\include\\vulkan into the mirror for Vulkan headers, then builds the IDD solution from local NTFS with MSBuild. Edit sources on the Linux/Z:\\ side; the mirror is re-synced on every call. Empty msbuild_args builds Release|x64 with RunInfVerif=false."
+        description = "Sync the project to the local Windows mirror and build the Looking Glass IDD WDK driver from LookingGlass\\idd\\LGIdd.sln. This mirrors Z:\\ -> the local mirror (HELIOS_WIN_USER-derived) with robocopy (excluding target/, all .git dirs, and icd\\mesa), copies only icd\\mesa\\include\\vulkan into the mirror for Vulkan headers, then builds the IDD solution from local NTFS with MSBuild. Edit sources on the Linux/Z:\\ side; the mirror is re-synced on every call. Empty msbuild_args builds Release|x64 with RunInfVerif=false."
     )]
     async fn win_looking_glass_idd(
         &self,
@@ -456,7 +511,8 @@ impl WinHost {
         let mesa_exclude = mesa_exclude_for_source(&source_root);
         let mesa_vulkan_src = ps_join_path(&source_root, "icd\\mesa\\include\\vulkan");
         let msbuild = a.msbuild_path.unwrap_or_else(|| MSBUILD.to_string());
-        let sln = format!("{MIRROR_ROOT}\\LookingGlass\\idd\\LGIdd.sln");
+        let mirror_root = mirror_root();
+        let sln = format!("{mirror_root}\\LookingGlass\\idd\\LGIdd.sln");
         let msbuild_args = if a.msbuild_args.is_empty() {
             "/p:Configuration=Release /p:Platform=x64 /p:RunInfVerif=false /m /v:minimal"
                 .to_string()
@@ -475,10 +531,10 @@ impl WinHost {
 
         let command = format!(
             "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass_idd: source root not found: {source_root}\"; exit 3 }}\n\
-             robocopy \"{source_root}\" {MIRROR_ROOT} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+             robocopy \"{source_root}\" {mirror_root} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
              if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass_idd: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
-             New-Item -ItemType Directory -Force -Path '{MIRROR_ROOT}\\icd\\mesa\\include\\vulkan' | Out-Null\n\
-             robocopy \"{mesa_vulkan_src}\" {MIRROR_ROOT}\\icd\\mesa\\include\\vulkan /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+             New-Item -ItemType Directory -Force -Path '{mirror_root}\\icd\\mesa\\include\\vulkan' | Out-Null\n\
+             robocopy \"{mesa_vulkan_src}\" {mirror_root}\\icd\\mesa\\include\\vulkan /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
              if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass_idd: Vulkan header sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
              if (!(Test-Path -LiteralPath '{sln}')) {{ \"win_looking_glass_idd: LGIdd.sln missing after sync: {sln}\"; exit 2 }}\n\
              {build}"
@@ -519,7 +575,8 @@ async fn main() -> Result<()> {
     // Drop any stale SSH ControlMaster so the first build picks up the current
     // machine environment (PATH/vars updated by recent toolchain installs).
     let _ = Command::new("ssh")
-        .args(["-O", "exit", SSH_HOST])
+        .args(["-O", "exit"])
+        .arg(ssh_host())
         .output()
         .await;
 
