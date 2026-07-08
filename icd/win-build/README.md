@@ -3,7 +3,7 @@
 Out-of-tree scaffolding for compiling the vendored Mesa `venus` driver
 (`icd/mesa`, Phase 5) on Windows **without editing the Mesa submodule** — venus
 stays byte-identical to upstream so it can be re-synced. Full recipe + the
-ranked toolchain decision are in [`../PHASE5_HANDOVER.md`](../PHASE5_HANDOVER.md) §6.
+ranked toolchain decision are in [`../../docs/archive/PHASE5_HANDOVER.md`](../../docs/archive/PHASE5_HANDOVER.md) §6.
 
 - **`helios_win_compat.h`** — the single forced-include (`-include` / `/FI`) that
   makes venus compile on Windows: `pid_t`, the clang-cl interlocked-intrinsic

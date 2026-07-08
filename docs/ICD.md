@@ -2,7 +2,7 @@
 
 > **⚠️ The HAND-WRITTEN ICD described below is SUPERSEDED by a port of Mesa's `venus` driver** (ARCH.md §5; `mesa-venus-icd-port` memory). The chosen ICD reuses Mesa's mature, byte-correct `vn_protocol_driver_*` Venus encoder and adds only a `vn_renderer_helios.c` backend over the IOCTL channel — we do **not** hand-roll the encoder. Treat the encoder/instance/device sections here as background. What REMAINS authoritative is the **ICD↔KMD contract**: the Vulkan-loader registration (Khronos registry JSON), the required `vk_icd*` exports, and the `DeviceIoControl` / `GUID_DEVINTERFACE_HELIOS` transport (§2.2) that `vn_renderer_helios.c` drives.
 >
-> **➡️ The Phase 5 implementation brief is [`icd/PHASE5_HANDOVER.md`](icd/PHASE5_HANDOVER.md)** — start there. It has the concrete, verified port plan: the vn_renderer→IOCTL vtable mapping, the exact meson edits + `meson setup` command + configure gates, the hardcoded `vn_renderer_info` (Helios has no GET_CAPSET IOCTL), the MSVC `.def` export requirement, and the ranked risks (the ring-shmem `abort()` / `blob_id=0` re-verify first). Mesa is vendored as a submodule at `icd/mesa` (fork: github.com/rupansh/mesa-helios).
+> **➡️ The Phase 5 implementation brief is [`archive/PHASE5_HANDOVER.md`](archive/PHASE5_HANDOVER.md)** — start there. It has the concrete, verified port plan: the vn_renderer→IOCTL vtable mapping, the exact meson edits + `meson setup` command + configure gates, the hardcoded `vn_renderer_info` (Helios has no GET_CAPSET IOCTL), the MSVC `.def` export requirement, and the ranked risks (the ring-shmem `abort()` / `blob_id=0` re-verify first). Mesa is vendored as a submodule at `icd/mesa` (fork: github.com/rupansh/mesa-helios).
 
 ## Overview
 

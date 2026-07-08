@@ -2,7 +2,7 @@
 
 > **ARCHIVED (2026-06-07):** this file is no longer canonical. The active project direction is
 > **System-class KMDF + DeviceIoControl + Mesa Venus**. Read
-> [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) and [`ARCH.md`](ARCH.md) first.
+> [`../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`](../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md) and [`ARCH.md`](ARCH.md) first.
 > Keep this file only as historical reference for the DOD/`SET_SCANOUT_BLOB` display experiment and its
 > assumptions.
 

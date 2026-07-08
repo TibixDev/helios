@@ -2,7 +2,7 @@
 
 > **ARCHIVED (2026-06-07):** this was the handoff for the WDDM Display-Only Driver bring-up. The active project
 > direction has switched back to System-class KMDF + DeviceIoControl + Mesa Venus. Read
-> [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) first. Keep this file only as a
+> [`../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`](../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md) first. Keep this file only as a
 > record of DOD/VidPN/Code 43 findings.
 
 Original title: Helios DOD — Phase 7.1b "Code 43 after present" — Handoff for ChatGPT Codex
@@ -85,7 +85,7 @@ with raw `ssh win` PowerShell calls:
   (`~/.ssh/config` has `Host win`). This VM is always up; it is where you BUILD and where you
   read device state. (It is a *different* VM from the standalone test qemu — see §1.)
 
-**Toolchain already installed on the win11 VM** (verified; see `TOOLCHAIN.md`):
+**Toolchain already installed on the win11 VM** (verified; see `../TOOLCHAIN.md`):
 - VS 2022 Build Tools, "Desktop development with C++" (MSVC v143 + Spectre x64 libs).
 - **WDK + SDK 10.0.26100.0** (a *complete* matched kit — `wdk-build` picks the highest kit).
 - **LLVM 17.0.6** at `C:\Program Files\LLVM\bin` → set `LIBCLANG_PATH` to it for bindgen
@@ -168,7 +168,7 @@ so the newest build always out-ranks older staged packages.
 - `diag.rs` — TEMPORARY registry-breadcrumb tracer (see §3). Strip before final commit.
 - `adapter.rs` — the WDF/dxgk adapter context (saved `DXGKRNL_INTERFACE`, virtio handle,
   `isr_status_va`).
-- `.dod-vidpn-types.md` (untracked) — the exact bindgen FFI shapes for the VidPN structs
+- `dod-vidpn-types.md` (untracked) — the exact bindgen FFI shapes for the VidPN structs
   (pfn signatures, field paths, `_<TAG>::VARIANT` enum forms). Read this before touching FFI.
 
 ---
@@ -345,7 +345,7 @@ is pursued.
 
 Touched (vs HEAD `b9b1e81`): `kmd/src/{lib,dod,vidpn,diag,adapter,virtio/gpu}.rs`,
 `protocol/src/features.rs`, `kmd/helios_kmd.inx`, `tools/launch-helios-gtk.sh`; untracked
-`.dod-vidpn-types.md`. The display **comes up** (commit+present, primary 1024×768) then Code
+`dod-vidpn-types.md`. The display **comes up** (commit+present, primary 1024×768) then Code
 43. This is the best functional state reached. The `diag.rs` breadcrumb surface
 (HeliosSeq/HeliosPiv/HeliosPost/HeliosTAnp/HeliosQai + `record_step_only`) is TEMPORARY and
 should be stripped once Code 43 is fixed. The relevant project memory is

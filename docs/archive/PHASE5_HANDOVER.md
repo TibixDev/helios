@@ -8,7 +8,7 @@
 > (a missing `RESOURCE_CREATE_3D` shifted SUBMIT_3D/MAP_BLOB/UNMAP_BLOB — the values are now pinned
 > to the `virtio-bindings` crate by a `cargo test`), and `info.max_timeline_count` is **64** not 1
 > (§5 said 1, which fails `vkCreateDevice` — every queue needs ring_idx≥1). **The next workstream is
-> Phase 4e async submission — see `icd/PHASE4E_ASYNC_HANDOVER.md`.** The rest of this document is kept
+> Phase 4e async submission — see `PHASE4E_ASYNC_HANDOVER.md`.** The rest of this document is kept
 > as the historical implementation brief.
 
 **Status: DONE (was: the implementation brief).** Everything below is concrete and

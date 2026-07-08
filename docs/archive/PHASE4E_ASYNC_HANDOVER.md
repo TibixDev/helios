@@ -1,6 +1,8 @@
 # Phase 4e Handover — Async submission (non-blocking SUBMIT_VENUS)
 
-**Status: NOT STARTED (design only).** Read `phase4e-async-submit` + `phase5-ctx-attach` memories,
+> **DONE / ARCHIVED (banner added 2026-07-08).** Async submission shipped (see kmd/src/ioctl.rs submit path and PHASE6_WSI_HANDOVER.md); the header below is the original design-time text, kept for the no-async-Rust rationale and the interrupt-blocker record (section 4).
+
+**Status (original): NOT STARTED (design only).** Read `phase4e-async-submit` + `phase5-ctx-attach` memories,
 then ARCH.md §5/§13, then this. Everything here is verified against the trees on `master` (git
 `28c7eb1` + the doc commit).
 

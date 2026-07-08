@@ -83,10 +83,10 @@ The `SET_SCANOUT_BLOB` idea is still useful, but it should be tested as a small,
 
 Keep, but do not treat as active:
 
-- `DISPLAY.md`
-- `PHASE7_DISPLAY_HANDOVER.md`
-- `CODE43_HANDOFF_FOR_CODEX.md`
-- `.dod-vidpn-types.md`
+- `archive/DISPLAY.md`
+- `archive/PHASE7_DISPLAY_HANDOVER.md`
+- `archive/CODE43_HANDOFF_FOR_CODEX.md`
+- `archive/dod-vidpn-types.md`
 - `kmd/src/dxgk.rs` and DOD-scoped dxgk/dispmprt binding knowledge, if present
 - DOD VidPN/rotation breadcrumbs and notes
 
@@ -101,6 +101,6 @@ These are reference material for a future display-driver attempt.
 
 ## Documentation Status
 
-- `ARCH.md`, `OVERVIEW.md`, `KMD.md`, `ICD.md`, `TOOLCHAIN.md`, and `CLAUDE.md` should describe System-class KMDF + IOCTL Venus as canonical.
-- `DISPLAY.md`, `PHASE7_DISPLAY_HANDOVER.md`, and `CODE43_HANDOFF_FOR_CODEX.md` are archived DOD/display-pivot records.
+- `ARCH.md`, `../README.md`, `KMD.md`, `ICD.md`, `TOOLCHAIN.md`, and `CLAUDE.md` should describe System-class KMDF + IOCTL Venus as canonical.
+- `archive/DISPLAY.md`, `archive/PHASE7_DISPLAY_HANDOVER.md`, and `archive/CODE43_HANDOFF_FOR_CODEX.md` are archived DOD/display-pivot records.
 - References to project "memory" names from prior agents should be treated as historical breadcrumbs, not active instructions, unless they match this direction reset.

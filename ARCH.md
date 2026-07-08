@@ -2,11 +2,11 @@
 
 > **DIRECTION RESET (2026-06-07):** this file is again canonical for the active project direction.
 > The WDDM Display-Only Driver pivot is archived as reference only. Read
-> [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) for the decision record and
-> [`DISPLAY.md`](DISPLAY.md) / [`PHASE7_DISPLAY_HANDOVER.md`](PHASE7_DISPLAY_HANDOVER.md) only for historical
+> [`docs/decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`](docs/decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md) for the decision record and
+> [`docs/archive/DISPLAY.md`](docs/archive/DISPLAY.md) / [`docs/archive/PHASE7_DISPLAY_HANDOVER.md`](docs/archive/PHASE7_DISPLAY_HANDOVER.md) only for historical
 > DOD/display findings. The active path is System-class KMDF + DeviceIoControl + Mesa Venus.
 
-**Status:** CANONICAL. This is the source of truth all the other docs are written against. It supersedes every WDDM/dxgkrnl/D3DKMTEscape active-plan passage in OVERVIEW.md, KMD.md, ICD.md, TRANSPORT.md, TOOLCHAIN.md, CLAUDE.md (HOST.md is unaffected). The WDDM render-miniport approach remains abandoned: a WDDM render adapter would need a native D3D-to-venus UMD and WDDM scheduling/memory contracts that do not help the Venus renderer. The DOD/display-only work is archived, not deleted, because its dxgk bindings and VidPN findings may be useful later.
+**Status:** CANONICAL. This is the source of truth all the other docs are written against. It supersedes every WDDM/dxgkrnl/D3DKMTEscape active-plan passage in README.md, docs/KMD.md, docs/ICD.md, docs/TRANSPORT.md, docs/TOOLCHAIN.md, CLAUDE.md (docs/HOST.md is unaffected). The WDDM render-miniport approach remains abandoned: a WDDM render adapter would need a native D3D-to-venus UMD and WDDM scheduling/memory contracts that do not help the Venus renderer. The DOD/display-only work is archived, not deleted, because its dxgk bindings and VidPN findings may be useful later.
 
 ## 0. The Pivot in One Paragraph
 
@@ -83,7 +83,7 @@ The ICD is a Windows port of Mesa's `venus` driver (`-Dvulkan-drivers=virtio`, d
 
 Device open replaces `D3DKMTOpenAdapterFromLuid`+`D3DKMTEscape` with the SetupDi/CreateFile path (§2); store the HANDLE where vtest stored its socket fd, guarded by a mutex. Build: the venus meson currently gates virtgpu behind HAVE_LIBDRM; the Windows port (like mvisor's `mesa-virgl-icd-for-windows.patch`) adds meson logic to build venus on Windows without libdrm and select the IOCTL backend.
 
-## 6. Host-visible blob mapping (resolves the TRANSPORT.md OPEN ITEM)
+## 6. Host-visible blob mapping (resolves the docs/TRANSPORT.md OPEN ITEM)
 
 The blob GPA is **not** in `VirtioGpuRespMapInfo` (that carries only the `map_info` caching byte). QEMU exposes a host-visible memory window as a prefetchable 64-bit PCI BAR (typically BAR4) advertised by a `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` cap with `shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE`, size = device `hostmem=` (256M..8G). `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB` makes the host inject the resource's mapping at an offset inside that BAR. So: the KMD records the SHARED_MEMORY_CFG(HOST_VISIBLE) BAR's guest-physical base during the cap scan; on MAP_BLOB it computes `gpa = host_visible_bar_base + offset`, builds an MDL over those pages, `MmMapLockedPagesSpecifyCache(mdl, UserMode, <WC or cached from map_info>)`, and returns the resulting **user VA** to the ICD. This is the value that previously would have filled WDDM's `query_segments` BaseAddress.
 
@@ -174,7 +174,7 @@ umd/                DELETE
 ## 13. STATUS (updated 2026-06-07) — System-class KMDF + IOCTL Venus is the active path
 
 Phases 0–5 reached end-to-end Venus rendering. The DOD/display pivot is archived in
-`SYSTEM_CLASS_REFOCUS_2026_06_07.md` and should not block renderer work. The active next work is Venus
+`docs/decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md` and should not block renderer work. The active next work is Venus
 performance on the System-class path: async submit, fence completion, blob mapping, and offscreen render
 throughput before revisiting presentation.
 
@@ -188,4 +188,4 @@ throughput before revisiting presentation.
 
 **✅ Phase 5 DONE (2026-06-05, committed — the Mesa venus ICD works end-to-end on real hardware).** `icd/mesa/src/virtio/vulkan/vn_renderer_helios.c` (the IOCTL `vn_renderer` backend) + `vn_renderer.h`/`meson.build` edits are committed to the fork (submodule bumped). Validated against real venus on the Intel ARL iGPU: `vulkaninfo --summary` → `DRIVER_ID_MESA_VENUS`, `driverName venus` (Intel ARL + llvmpipe); `vkCreateInstance`/`vkEnumeratePhysicalDevices`/`vkCreateDevice`; host-visible `vkAllocateMemory`(ALLOC_BLOB blob_id=mem_id)/`vkMapMemory`(MAP_BLOB) with readback; and **real GPU command execution** (`vkCmdFillBuffer`+`vkQueueSubmit`+fence+readback = `0xDEADBEEF`). Test harnesses: `icd/win-build/helios_vk_{smoke,dev,exec,poll}.c`. Two bring-up bugs fixed en route: (1) the virtio-gpu **command opcodes** were miscounted (a missing `RESOURCE_CREATE_3D` shifted SUBMIT_3D/MAP_BLOB/UNMAP_BLOB) — now pinned to the **`virtio-bindings`** crate via `cargo test` (dev-dep; const values + struct size/align); (2) `info.max_timeline_count` 1→64 (each queue binds ring_idx≥1). Detail: the `phase5-ctx-attach`, `phase5-backend-status`, `mesa-venus-icd-port` memories.
 
-**NEXT = Phase 4e (async submission) — the proper fix for the synchronous-submit deadlock class.** Today `submit_venus` blocks (spin-polls the used ring via `add_notify_wait_pop`); the one known Phase-5 gap is `vkQueueWaitIdle`/`vkDeviceWaitIdle` → `VK_ERROR_UNKNOWN` (the empty-submit fence-feedback ffb slot is never seen updated; non-fatal — ordinary fence waits work). Plan: make SUBMIT_VENUS non-blocking (KMD in-flight buffer pool + drain/`pop_used` + wire the already-built `FenceTable`), and defer the ICD's premature `sync->val` to a real `WAIT_FENCE`; **poll-first, then interrupt-driven** (the `WDFINTERRUPT` + DIRQL ISR-status-read + DPC path, gated on resolving the `STATUS_DEVICE_POWER_FAILURE`/MSI-X-vs-INTx interrupt-resource question). Then: an optimal vkcube **present** path (NOT a GDI `StretchDIBits` hack — mine the Linux virtio-gpu driver's present/flush flow and find the Windows-equivalent surface/composition API), then DXVK + VKD3D-Proton. Full design + the no_std-async-Rust evaluation: **`icd/PHASE4E_ASYNC_HANDOVER.md`** and the `phase4e-async-submit` memory.
+**NEXT = Phase 4e (async submission) — the proper fix for the synchronous-submit deadlock class.** Today `submit_venus` blocks (spin-polls the used ring via `add_notify_wait_pop`); the one known Phase-5 gap is `vkQueueWaitIdle`/`vkDeviceWaitIdle` → `VK_ERROR_UNKNOWN` (the empty-submit fence-feedback ffb slot is never seen updated; non-fatal — ordinary fence waits work). Plan: make SUBMIT_VENUS non-blocking (KMD in-flight buffer pool + drain/`pop_used` + wire the already-built `FenceTable`), and defer the ICD's premature `sync->val` to a real `WAIT_FENCE`; **poll-first, then interrupt-driven** (the `WDFINTERRUPT` + DIRQL ISR-status-read + DPC path, gated on resolving the `STATUS_DEVICE_POWER_FAILURE`/MSI-X-vs-INTx interrupt-resource question). Then: an optimal vkcube **present** path (NOT a GDI `StretchDIBits` hack — mine the Linux virtio-gpu driver's present/flush flow and find the Windows-equivalent surface/composition API), then DXVK + VKD3D-Proton. Full design + the no_std-async-Rust evaluation: **`docs/archive/PHASE4E_ASYNC_HANDOVER.md`** and the `phase4e-async-submit` memory.

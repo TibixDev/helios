@@ -2,7 +2,7 @@
 
 > **DIRECTION RESET (2026-06-07):** active KMD work is System-class KMDF + DeviceIoControl + Mesa Venus.
 > DOD/dxgk build artifacts may remain as archived reference, but the active build should follow `ARCH.md` and
-> `SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
+> `decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
 
 ## Overview
 

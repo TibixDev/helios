@@ -1,12 +1,19 @@
 # Display Way Forward — after System-class Venus coherency
 
+> **ARCHIVED (2026-07-08).** Historical decision record. The "Looking Glass
+> direct" path this document recommends was implemented and later REMOVED
+> (commits 028562d -> c79670c -> 3ff0f37) after the plain GDI present path
+> measured equivalently post cache-coherency fix. Active display work is the
+> normal Looking Glass IDD + KVMFR path: see ../LOOKING_GLASS.md.
+
+
 **Date:** 2026-06-07
 
 > **Update (2026-06-08):** the IDD experiment below was pursued through the vendored Looking Glass IDD. The direct
 > IDD-to-Helios/Venus scanout path was retired after black/grey output despite nonzero test-pattern frames. The
 > active desktop-output path is now the normal Looking Glass IDD producer with KVMFR/ivshmem transport. The IDD
 > capture path drops frames instead of blocking when D3D12 copy queues are saturated, and the IddCx 1.10 HDR/WCG
-> path now prefers 10 bpc. See [`LOOKING_GLASS_HELIOS_2026_06_08.md`](LOOKING_GLASS_HELIOS_2026_06_08.md).
+> path now prefers 10 bpc. See [`../LOOKING_GLASS.md`](../LOOKING_GLASS.md).
 
 The System-class KMDF + Mesa Venus path is now the renderer baseline: `vkcube` renders normally, cached
 `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED` memory is handled explicitly, and close-time ICD teardown assertions are

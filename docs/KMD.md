@@ -4,7 +4,7 @@
 
 The KMD (Kernel-Mode Driver) is a **System-class KMDF function driver** for the virtio-gpu PCI device. It lives in the Windows kernel, talks to the virtio-gpu device, and exposes the virtio-gpu Venus transport to user mode via a **DeviceIoControl device interface** (`GUID_DEVINTERFACE_HELIOS`). It is **not** a display/WDDM miniport: there is no dxgkrnl, no GPU-VA / segment / monitored-fence contract, and no user-mode display driver. The Vulkan ICD (a Windows port of Mesa's `venus`) reaches the KMD purely through IOCTLs on that device interface, and is enumerated independently by the Windows Vulkan loader via the Khronos registry JSON.
 
-See `ARCH.md` (canonical) and `SYSTEM_CLASS_REFOCUS_2026_06_07.md` for the active architecture; this guide is the implementation companion for the `kmd/` crate.
+See `ARCH.md` (canonical) and `decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md` for the active architecture; this guide is the implementation companion for the `kmd/` crate.
 
 **References:**
 - KMDF getting started: https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/getting-started-with-kmdf

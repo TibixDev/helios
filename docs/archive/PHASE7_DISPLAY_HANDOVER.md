@@ -2,7 +2,7 @@
 
 > **ARCHIVED (2026-06-07):** do not use this as the active handover. The active direction is
 > System-class KMDF + DeviceIoControl + Mesa Venus; see
-> [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md). This file is kept as a historical
+> [`../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`](../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md). This file is kept as a historical
 > record of the DOD/`SET_SCANOUT_BLOB` pivot and the work that followed it.
 
 ---
@@ -62,7 +62,7 @@ scanout-0 arbiter (the gpu.rs `set_scanout_blob`/`resource_flush` + the venus `p
 
 **Build/test discipline:** `win` MCP (`win_cargo`/`win_meson`/`win_exec`); the driver is a same-named service
 so a **reboot** is needed after each `devcon update` (live-swap → Code 14). `kmd/src/diag.rs` is the TEMPORARY
-breadcrumb tracer (remove once committing cleanly). `.dod-vidpn-types.md` (untracked) holds the exact bindgen
+breadcrumb tracer (remove once committing cleanly). `dod-vidpn-types.md` (untracked) holds the exact bindgen
 VidPN types. Owner runs the standalone (`sudo`) + does the visual confirm; Claude can't sudo and can't see the
 screen.
 
@@ -168,7 +168,7 @@ Per `DISPLAY.md` §3–§5 and §9. In order:
 
 ## 5. Historical Reading Order
 
-For active work, read `SYSTEM_CLASS_REFOCUS_2026_06_07.md` and `ARCH.md` first.
+For active work, read `../decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md` and `ARCH.md` first.
 
 For historical DOD/display investigation only:
 
