@@ -37,8 +37,9 @@ jobs:
 
       # LLVM 17 for bindgen (windows-drivers-rs wants libclang; 18 has a bindgen
       # bug per TOOLCHAIN.md). The WDK + SDK 10.0.26100 ship on windows-2022.
+      # The runner image preinstalls a newer LLVM; force the pinned version.
       - name: Install LLVM 17
-        run: choco install llvm --version=17.0.6 -y --no-progress
+        run: choco install llvm --version=17.0.6 -y --no-progress --allow-downgrade
 
       - name: Locate WDK/SDK
         shell: pwsh
