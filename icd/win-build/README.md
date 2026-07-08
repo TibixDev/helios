@@ -9,7 +9,7 @@ ranked toolchain decision are in [`../../docs/archive/PHASE5_HANDOVER.md`](../..
   makes venus compile on Windows: `pid_t`, the clang-cl interlocked-intrinsic
   aliases, and the `sync_wait`/`sync_valid_fd` libsync stubs. Each block self-gates
   to the toolchain that needs it. ⚠️ the sync stubs are PLACEHOLDERS — real fence
-  waits route through the KMD `WAIT_FENCE` IOCTL once `vn_renderer_helios.c` exists.
+  waits route through the KMD `WAIT_FENCE` IOCTL via `vn_renderer_helios.c`.
 - **`mingw-native.ini`** — meson native file for **mingw-w64 gcc** (RECOMMENDED:
   cleanest, builds straight from `Z:\`, gcc-native GNU extensions; validated to
   compile 100% of venus with zero Mesa edits). Paths are VM-specific.
@@ -17,13 +17,13 @@ ranked toolchain decision are in [`../../docs/archive/PHASE5_HANDOVER.md`](../..
   compile 100% of venus, but needs a local C: source mirror + an STL-mismatch
   define + the SDK `rc.exe`; the alternative, not the default).
 
-Both toolchains reach the final link step; the remaining undefined symbols
-(`vn_renderer_create_vtest`, the SPIR-V→NIR `vtn_*`) are the unwritten
-`vn_renderer_helios.c` backend + libvtn wiring — real Phase 5 work, not portability.
+Both toolchains reach the final link step; the historical link-blockers
+(`vn_renderer_create_vtest`, the SPIR-V→NIR `vtn_*`) were resolved by Phase 5:
+`vn_renderer_helios.c` exists in `icd/mesa` and the ICD links + ships.
 
 Quick build (mingw, from the win-mcp `win_meson` tool):
 ```
-win_meson(["setup","C:\\Users\\Rupansh\\helios-mesa-build","Z:\\icd\\mesa",
+win_meson(["setup","{MESA_BUILD}","Z:\\icd\\mesa",
   "--native-file","Z:\\icd\\win-build\\mingw-native.ini",
   "-Dc_args=-includeZ:\\icd\\win-build\\helios_win_compat.h",
   "-Dvulkan-drivers=virtio","-Dgallium-drivers=","-Dplatforms=windows","-Dvideo-codecs=",
@@ -41,7 +41,7 @@ Z:\tools\install-helios-icd.ps1
 ```
 
 The installer copies `vulkan_virtio.dll` from
-`C:\Users\Rupansh\helios-mesa-build\src\virtio\vulkan\` to a content-hashed
+`%USERPROFILE%\helios-mesa-build\src\virtio\vulkan\` to a content-hashed
 ProgramData filename such as `vulkan_virtio-ed15edb62e6d.dll`, writes
 `C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json` with
 `library_path` pointing at that versioned DLL, removes stale Helios/Virtio Vulkan registry values, and registers the manifest under

@@ -41,9 +41,9 @@ if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
     bash "$0" "$@"
 fi
 
-USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
+USER_NAME=${SUDO_USER:-$(id -un)}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
-SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
+SWSRC=${HELIOS_SWTPM_SRC:-/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2}; TPMDIR=/tmp/helios-tpm; SHARE=${HELIOS_SHARE:-$HOME/helios-vgpu}
 DISPLAY_MODE=${HELIOS_DISPLAY:-gtk}
 QEMU_RENDER_GPU=${HELIOS_QEMU_RENDER_GPU:-intel}
 INTEL_RENDER_NODE=${HELIOS_INTEL_RENDER_NODE:-/dev/dri/renderD129}
@@ -362,7 +362,7 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
   fi
 fi
 
-echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. SSH 192.168.122.120 <<<"
+echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, host GPU: $QEMU_RENDER_GPU). Z:\\ = repo. <<<"
 # Capture QEMU + virgl_render_server (vkr_log) stderr; render-server diagnostics
 # like "failed to look up object" / "mem fd export failed" land here. Optional
 # HELIOS_VKR_DEBUG (e.g. "validate" / "all") enables vkr debugging incl. host-side

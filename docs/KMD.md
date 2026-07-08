@@ -21,7 +21,7 @@ The working, building source under `kmd/` is the ground truth — prefer it over
 - **KMDF active build — `wdk-sys` + WDF.** The driver uses the WDF function table that `wdk-sys` auto-wires; calls go through `wdk_sys::call_unsafe_wdf_function_binding!`. The active build should not link `displib` or depend on `DxgkInitialize*`, `DRIVER_INITIALIZATION_DATA`, `DXGK_DRIVERCAPS`, the QUERYSEGMENT/GPUMMU caps, the render-DDI list, or any `DXGK*` symbol. The DOD-scoped `dispmprt.h`/`d3dkmddi.h` bindgen / `src/dxgk.rs` may remain in the repository as archived reference material, but it is not part of the active System-class KMDF path.
 - **`Cargo.toml` driver-type is `KMDF`** with `kmdf-version` set (1.33); the bindgen build-dependency is dropped.
 - **Panic handler:** do **not** define your own `#[panic_handler]` — just `extern crate wdk_panic;` (it supplies one; a second is a duplicate lang item).
-- **Build on local disk, never `Z:\`** (cargo/wdk IO fails on the 9p share — OS error 87, windows-drivers-rs#481): the `win` MCP `win_cargo` tool robocopy-mirrors to `C:\Users\Rupansh\helios-vgpu` and builds there. See TOOLCHAIN.md.
+- **Build on local disk, never `Z:\`** (cargo/wdk IO fails on the 9p share — OS error 87, windows-drivers-rs#481): the `win` MCP `win_cargo` tool robocopy-mirrors to `C:\Users\<user>\helios-vgpu` and builds there. See TOOLCHAIN.md.
 
 ---
 
@@ -198,6 +198,15 @@ impl DriverError {
 ```
 
 The context **drops** the WDDM-era `dxgkrnl: Option<DXGKRNL_INTERFACE>` field and the `pdo`/`dxgkrnl()` accessor — no Dxgkrnl exists under KMDF. It **adds** the `fence_id -> KEVENT` table consumed by `WAIT_FENCE` (signalled from the interrupt DPC).
+
+> **Shipped reality (2026-07-08):** the fence path is **poll-mode**, not interrupt-driven.
+> The KMD suppresses device notifications (`set_dev_notify(false)` in `kmd/src/virtio/gpu.rs`),
+> creates **no WDFINTERRUPT** (connecting one hit a `STATUS_DEVICE_POWER_FAILURE` blocker;
+> record in [archive/PHASE4E_ASYNC_HANDOVER.md](archive/PHASE4E_ASYNC_HANDOVER.md) section 4),
+> and `handle_wait_fence` (`kmd/src/ioctl.rs`) drives the used ring itself with a bounded
+> spin + `KeDelayExecutionThread` loop. The `FenceTable` (`kmd/src/fence.rs`) is compiled in
+> but unwired. Everywhere this document sketches KEVENT/ISR/DPC fence signalling, read it as
+> the *parked future interrupt design*, not current code.
 
 ---
 
@@ -619,7 +628,7 @@ impl Virtqueue {
 
 User mode reaches the KMD through `DeviceIoControl` on the device interface `GUID_DEVINTERFACE_HELIOS` (defined once in `helios_protocol` so the KMD and the Vulkan ICD share the constant). The ICD discovers and opens it with `SetupDiGetClassDevs(DIGCF_DEVICEINTERFACE|DIGCF_PRESENT)` → `SetupDiEnumDeviceInterfaces` → `SetupDiGetDeviceInterfaceDetail` → `CreateFileW` → `DeviceIoControl`.
 
-The six wire ops keep their exact `helios_protocol` layout (`protocol/src/escape.rs`); they simply move from the old D3DKMTEscape carrier to IOCTL input/output buffers. The IOCTL **control code is the verb**, and WDF validates the in/out buffer lengths, so the 16-byte `HeliosEscapeHeader` (magic/cmd_type/version/size) becomes redundant — keep it only as an optional cheap version sanity check.
+The wire ops keep their exact `helios_protocol` layout (`protocol/src/escape.rs`); they simply move from the old D3DKMTEscape carrier to IOCTL input/output buffers. The IOCTL **control code is the verb**, and WDF validates the in/out buffer lengths, so the 16-byte `HeliosEscapeHeader` (magic/cmd_type/version/size) becomes redundant — keep it only as an optional cheap version sanity check.
 
 ### IOCTL constants
 
@@ -631,8 +640,10 @@ The six wire ops keep their exact `helios_protocol` layout (`protocol/src/escape
 | CTX_DESTROY  | `IOCTL_HELIOS_CTX_DESTROY`  | `0x0022E404` | BUFFERED  |
 | SUBMIT_VENUS | `IOCTL_HELIOS_SUBMIT_VENUS` | `0x0022E409` | IN_DIRECT |
 | ALLOC_BLOB   | `IOCTL_HELIOS_ALLOC_BLOB`   | `0x0022E40C` | BUFFERED  |
-| MAP_BLOB     | `IOCTL_HELIOS_MAP_BLOB`     | `0x0022E412` | OUT_DIRECT |
+| MAP_BLOB     | `IOCTL_HELIOS_MAP_BLOB`     | `0x0022E410` | BUFFERED  |
 | WAIT_FENCE   | `IOCTL_HELIOS_WAIT_FENCE`   | `0x0022E414` | BUFFERED  |
+| PRESENT_BLOB | `IOCTL_HELIOS_PRESENT_BLOB` | `0x0022E418` | BUFFERED  |
+| RELEASE_BLOB | `IOCTL_HELIOS_RELEASE_BLOB` | `0x0022E41C` | BUFFERED  |
 
 **Method rationale:** small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers the system buffer). `SUBMIT_VENUS`'s Venus stream can be megabytes, so it uses `METHOD_IN_DIRECT`: a small fixed header (`ctx_id`/`fence_id`/`buffer_size`) rides the buffered system buffer while the variable Venus blob arrives as a locked MDL (`WdfRequestRetrieveInputWdmMdl`). `MAP_BLOB` returns a **user VA**, not a GPA: the kernel does `MmMapLockedPagesSpecifyCache(blobMdl, UserMode, …)` and writes the resulting user VA into the OUT buffer — hence the op struct field is `out_user_va` (renamed from the old `out_gpa`).
 

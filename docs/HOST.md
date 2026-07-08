@@ -7,6 +7,12 @@ The Linux host side of the Helios vGPU project consists of:
 2. **virglrenderer** built with Venus support
 3. **Host Vulkan driver** (RADV for AMD, ANV for Intel, or NVIDIA proprietary)
 
+> **Check stock packages first (verified 2026-07-08):** Fedora 41+ ships QEMU >= 9.1 and a
+> Venus-enabled virglrenderer (`/usr/libexec/virgl_render_server` present); Fedora 44 stock
+> qemu 10.2 + virglrenderer 1.3 run the full Helios stack with no source builds. Probe with
+> `qemu-system-x86_64 -device virtio-gpu-gl-pci,help | grep venus`. The build-from-source
+> instructions below are only needed when your distro's packages lack Venus.
+
 You do NOT write a custom host-side daemon for the primary path — virglrenderer handles everything. The `host/` crate in this repo is for diagnostics and optional custom transport.
 
 The host stack is identical regardless of the guest driver model: the current System-class KMDF + DeviceIoControl guest uses the exact same venus/virglrenderer host setup described here as the earlier guest design did, so nothing in this document changes with the guest carrier.

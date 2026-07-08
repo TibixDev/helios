@@ -304,11 +304,13 @@ pub const IOCTL_HELIOS_CTX_CREATE:   u32 = ctl_code(0x900, 0); // METHOD_BUFFERE
 pub const IOCTL_HELIOS_CTX_DESTROY:  u32 = ctl_code(0x901, 0); // METHOD_BUFFERED   = 0x0022E404
 pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 = ctl_code(0x902, 1); // METHOD_IN_DIRECT  = 0x0022E409
 pub const IOCTL_HELIOS_ALLOC_BLOB:   u32 = ctl_code(0x903, 0); // METHOD_BUFFERED   = 0x0022E40C
-pub const IOCTL_HELIOS_MAP_BLOB:     u32 = ctl_code(0x904, 2); // METHOD_OUT_DIRECT = 0x0022E412
+pub const IOCTL_HELIOS_MAP_BLOB:     u32 = ctl_code(0x904, 0); // METHOD_BUFFERED   = 0x0022E410
 pub const IOCTL_HELIOS_WAIT_FENCE:   u32 = ctl_code(0x905, 0); // METHOD_BUFFERED   = 0x0022E414
+pub const IOCTL_HELIOS_PRESENT_BLOB: u32 = ctl_code(0x906, 0); // METHOD_BUFFERED   = 0x0022E418
+pub const IOCTL_HELIOS_RELEASE_BLOB: u32 = ctl_code(0x907, 0); // METHOD_BUFFERED   = 0x0022E41C
 ```
 
-**Method rationale:** the small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers — the mvisor pattern). SUBMIT_VENUS's Venus stream can be megabytes, so `METHOD_IN_DIRECT` carries the variable payload via a locked input MDL while a small fixed header (ctx_id / fence_id / buffer_size) rides the buffered system buffer. MAP_BLOB uses `METHOD_OUT_DIRECT` and returns a **user VA** (8-byte pointer) in its OUT buffer; the page mapping is the side effect (see §6.2).
+**Method rationale:** the small fixed verbs use `METHOD_BUFFERED` (the I/O manager double-buffers — the mvisor pattern). SUBMIT_VENUS's Venus stream can be megabytes, so `METHOD_IN_DIRECT` carries the variable payload via a locked input MDL while a small fixed header (ctx_id / fence_id / buffer_size) rides the buffered system buffer. MAP_BLOB is `METHOD_BUFFERED` and returns a **user VA** (8-byte pointer) in its OUT buffer; the page mapping is the side effect (`MmMapLockedPagesSpecifyCache(UserMode)`), not copied data, so a locked output MDL would be pure overhead (see §6.2).
 
 The op-struct byte layouts (`HeliosCtxCreate`, `HeliosCtxDestroy`, `HeliosSubmitVenus`, `HeliosAllocBlob`, `HeliosMapBlob`, `HeliosWaitFence`) live in `protocol/src/escape.rs` as `Pod` types. The old 16-byte `HeliosEscapeHeader` (magic/cmd_type/version/size) is **redundant** — the IOCTL control code *is* the verb and WDF validates the in/out lengths — so it is dropped (or kept only as a cheap version sanity check); the op-struct layouts are unchanged.
 
@@ -364,7 +366,7 @@ Each `ioctl_*` retrieves its buffers (`WdfRequestRetrieveInputBuffer` / `WdfRequ
 
 ## 4. Venus Command Encoding (Rust)
 
-The Venus encoding is mechanically generated from `vk.xml` in the real Mesa implementation. For our Rust implementation, we will write the encoder manually for the subset of Vulkan we need, cross-referencing the virglrenderer decoder source.
+The Venus encoding is mechanically generated from `vk.xml` in Mesa. **Superseded plan note:** an early plan was to hand-write a Rust encoder for a Vulkan subset; the shipped ICD instead ports Mesa's venus driver itself (`icd/mesa`), reusing its generated `vn_protocol_driver_*` encoders byte-for-byte. This section's wire-format description remains valid reference.
 
 ### 4.1 Encoding Primitives
 
@@ -523,6 +525,13 @@ Every command with `VIRTIO_GPU_FLAG_FENCE` set causes virglrenderer to:
 The virtio ISR acks the interrupt and queues a DPC; the DPC drains the used ring and signals the fence value.
 
 ### 5.3 Fence Signaling (KMDF)
+
+> **Shipped reality (2026-07-08):** this section describes the parked interrupt design.
+> The current KMD is **poll-mode**: device notifications are suppressed, no WDFINTERRUPT is
+> created (STATUS_DEVICE_POWER_FAILURE blocker, see
+> [archive/PHASE4E_ASYNC_HANDOVER.md](archive/PHASE4E_ASYNC_HANDOVER.md) section 4), and
+> WAIT_FENCE drains the used ring itself in a bounded spin + KeDelayExecutionThread loop.
+> No IOCTL is pended and no KEVENT is signalled today.
 
 There are no WDDM monitored fences. The KMD keeps a `fence_id → KEVENT` table in the `AdapterContext`. On submit, the requested `fence_id` rides the `VIRTIO_GPU_FLAG_FENCE` command. When the DPC drains the matching used-ring entry it signals that `fence_id`'s KEVENT — and, if a `IOCTL_HELIOS_WAIT_FENCE` request was pended on that fence, completes the pended IOCTL. WAIT_FENCE carries `fence_id` + `timeout_ns`; the handler either returns immediately if the fence is already signaled, or blocks on (pends against) the KEVENT until the DPC fires or the timeout elapses.
 

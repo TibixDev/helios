@@ -379,53 +379,58 @@ pub extern "C" fn vk_enumerate_physical_devices(
 
 Implement in this order (each enables more test coverage):
 
+> **Status:** Tiers 1-4 are complete wholesale - the shipped ICD is Mesa's full venus
+> driver, so every entry point below exists generated-from-vk.xml rather than
+> hand-implemented. Verified by vulkaninfo, vkcube, and DOOM (2016) end-to-end.
+> DXVK itself (Tier 4's title goal) is still unvalidated - that is Phase 6 work.
+
 ### Tier 1: Minimum viable (`vulkaninfo` passes)
-- [ ] `vkCreateInstance` / `vkDestroyInstance`
-- [ ] `vkEnumeratePhysicalDevices`
-- [ ] `vkGetPhysicalDeviceProperties` / `vkGetPhysicalDeviceProperties2`
-- [ ] `vkGetPhysicalDeviceFeatures` / `vkGetPhysicalDeviceFeatures2`
-- [ ] `vkGetPhysicalDeviceQueueFamilyProperties`
-- [ ] `vkGetPhysicalDeviceMemoryProperties`
-- [ ] `vkGetPhysicalDeviceFormatProperties`
-- [ ] `vkEnumerateDeviceExtensionProperties`
-- [ ] `vkEnumerateInstanceExtensionProperties`
+- [x] `vkCreateInstance` / `vkDestroyInstance`
+- [x] `vkEnumeratePhysicalDevices`
+- [x] `vkGetPhysicalDeviceProperties` / `vkGetPhysicalDeviceProperties2`
+- [x] `vkGetPhysicalDeviceFeatures` / `vkGetPhysicalDeviceFeatures2`
+- [x] `vkGetPhysicalDeviceQueueFamilyProperties`
+- [x] `vkGetPhysicalDeviceMemoryProperties`
+- [x] `vkGetPhysicalDeviceFormatProperties`
+- [x] `vkEnumerateDeviceExtensionProperties`
+- [x] `vkEnumerateInstanceExtensionProperties`
 
 ### Tier 2: Device creation (`vkcube` passes)
-- [ ] `vkCreateDevice` / `vkDestroyDevice`
-- [ ] `vkGetDeviceQueue`
-- [ ] `vkCreateCommandPool` / `vkDestroyCommandPool`
-- [ ] `vkAllocateCommandBuffers` / `vkFreeCommandBuffers`
-- [ ] `vkBeginCommandBuffer` / `vkEndCommandBuffer`
-- [ ] `vkQueueSubmit` / `vkQueueWaitIdle`
-- [ ] `vkCreateFence` / `vkDestroyFence` / `vkWaitForFences` / `vkResetFences`
-- [ ] `vkCreateSemaphore` / `vkDestroySemaphore`
+- [x] `vkCreateDevice` / `vkDestroyDevice`
+- [x] `vkGetDeviceQueue`
+- [x] `vkCreateCommandPool` / `vkDestroyCommandPool`
+- [x] `vkAllocateCommandBuffers` / `vkFreeCommandBuffers`
+- [x] `vkBeginCommandBuffer` / `vkEndCommandBuffer`
+- [x] `vkQueueSubmit` / `vkQueueWaitIdle`
+- [x] `vkCreateFence` / `vkDestroyFence` / `vkWaitForFences` / `vkResetFences`
+- [x] `vkCreateSemaphore` / `vkDestroySemaphore`
 
 ### Tier 3: Memory (`vkAllocateMemory` chain)
-- [ ] `vkAllocateMemory` / `vkFreeMemory`
-- [ ] `vkMapMemory` / `vkUnmapMemory`
-- [ ] `vkFlushMappedMemoryRanges` / `vkInvalidateMappedMemoryRanges`
-- [ ] `vkCreateBuffer` / `vkDestroyBuffer`
-- [ ] `vkGetBufferMemoryRequirements`
-- [ ] `vkBindBufferMemory`
-- [ ] `vkCreateImage` / `vkDestroyImage`
-- [ ] `vkGetImageMemoryRequirements`
-- [ ] `vkBindImageMemory`
+- [x] `vkAllocateMemory` / `vkFreeMemory`
+- [x] `vkMapMemory` / `vkUnmapMemory`
+- [x] `vkFlushMappedMemoryRanges` / `vkInvalidateMappedMemoryRanges`
+- [x] `vkCreateBuffer` / `vkDestroyBuffer`
+- [x] `vkGetBufferMemoryRequirements`
+- [x] `vkBindBufferMemory`
+- [x] `vkCreateImage` / `vkDestroyImage`
+- [x] `vkGetImageMemoryRequirements`
+- [x] `vkBindImageMemory`
 
 ### Tier 4: Rendering (DXVK works)
-- [ ] `vkCreateRenderPass` / `vkDestroyRenderPass`
-- [ ] `vkCreateFramebuffer` / `vkDestroyFramebuffer`
-- [ ] `vkCreateShaderModule` / `vkDestroyShaderModule`
-- [ ] `vkCreateGraphicsPipelines` / `vkDestroyPipeline`
-- [ ] `vkCreatePipelineLayout` / `vkDestroyPipelineLayout`
-- [ ] `vkCreateDescriptorSetLayout` / `vkDestroyDescriptorSetLayout`
-- [ ] `vkCreateDescriptorPool` / `vkDestroyDescriptorPool`
-- [ ] `vkAllocateDescriptorSets` / `vkFreeDescriptorSets`
-- [ ] `vkUpdateDescriptorSets`
-- [ ] `vkCmdBeginRenderPass` / `vkCmdEndRenderPass`
-- [ ] `vkCmdBindPipeline`
-- [ ] `vkCmdBindVertexBuffers` / `vkCmdBindIndexBuffer`
-- [ ] `vkCmdDrawIndexed` / `vkCmdDraw`
-- [ ] `vkCmdCopyBuffer` / `vkCmdCopyImage`
+- [x] `vkCreateRenderPass` / `vkDestroyRenderPass`
+- [x] `vkCreateFramebuffer` / `vkDestroyFramebuffer`
+- [x] `vkCreateShaderModule` / `vkDestroyShaderModule`
+- [x] `vkCreateGraphicsPipelines` / `vkDestroyPipeline`
+- [x] `vkCreatePipelineLayout` / `vkDestroyPipelineLayout`
+- [x] `vkCreateDescriptorSetLayout` / `vkDestroyDescriptorSetLayout`
+- [x] `vkCreateDescriptorPool` / `vkDestroyDescriptorPool`
+- [x] `vkAllocateDescriptorSets` / `vkFreeDescriptorSets`
+- [x] `vkUpdateDescriptorSets`
+- [x] `vkCmdBeginRenderPass` / `vkCmdEndRenderPass`
+- [x] `vkCmdBindPipeline`
+- [x] `vkCmdBindVertexBuffers` / `vkCmdBindIndexBuffer`
+- [x] `vkCmdDrawIndexed` / `vkCmdDraw`
+- [x] `vkCmdCopyBuffer` / `vkCmdCopyImage`
 
 ### Tier 5: Presentation (Win32 WSI through Mesa Venus)
 The active ICD is Mesa Venus with Helios' `vn_renderer_helios.c` backend, and Win32 WSI is now functional enough

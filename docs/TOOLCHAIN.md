@@ -35,6 +35,12 @@ vulkaninfo --summary | grep -E "apiVersion|driverVersion"
 
 ### 1.2 Build virglrenderer with Venus
 
+> **Check stock packages first (verified 2026-07-08):** Fedora 41+ ships QEMU >= 9.1 and a
+> Venus-enabled virglrenderer (`/usr/libexec/virgl_render_server` present); Fedora 44 stock
+> qemu 10.2 + virglrenderer 1.3 run the full Helios stack with no source builds. Probe with
+> `qemu-system-x86_64 -device virtio-gpu-gl-pci,help | grep venus`. Build from source only
+> if your distro's packages lack Venus.
+
 ```bash
 # Dependencies (Ubuntu/Debian)
 sudo apt install -y \
@@ -175,7 +181,7 @@ ssh win "cd /d Z:\ && cargo make"   # cd into the shared folder, then build on w
 The remaining subsections (§2.1–§2.5) document the full from-scratch setup for reference, but most of it is already done on `win11`.
 
 > **IMPORTANT — building on `win11` (updated):**
-> - **Rust IO fails on the `Z:\` share.** `cargo`/`cargo make` hit `OS error 87 (The parameter is incorrect)` on artifact copies and warn `could not canonicalize path Z:\`. So the **Cargo target dir must be on local disk**, not the share. Edit source on `Z:\`; build with `CARGO_TARGET_DIR=C:\Users\Rupansh\helios-target\<crate>`.
+> - **Rust IO fails on the `Z:\` share.** `cargo`/`cargo make` hit `OS error 87 (The parameter is incorrect)` on artifact copies and warn `could not canonicalize path Z:\`. So the **Cargo target dir must be on local disk**, not the share. Edit source on `Z:\`; build with `CARGO_TARGET_DIR=C:\Users\<user>\helios-target\<crate>`. The win-mcp tools derive all such paths from the `HELIOS_WIN_USER` env var (see tools/win-mcp; further overrides: `HELIOS_WIN_SSH_HOST`, `HELIOS_WIN_MIRROR_ROOT`, `HELIOS_WIN_MESA_BUILD`, `HELIOS_WIN_MINGW_BIN`, `HELIOS_WIN_LG_BUILD`).
 > - Set it via the **`CARGO_TARGET_DIR` env var** per invocation. Do **NOT** put `target-dir` in a committed `.cargo/config.toml` — Linux reads that file too (it builds shared crates like `protocol/`), and a `C:` path would break it. On Linux use `CARGO_TARGET_DIR=target/linux`.
 > - **coreutils are installed** on `win11`: standard Unix tools (`ls`, `cp`, `mv`, `rm`, `cat`, …) work alongside PowerShell.
 > - Prefer the **`win` MCP server** (`win_exec` / `win_cargo`) over raw `ssh win "cd /d Z:\ && …"` — it sidesteps cmd.exe quoting and stale-ControlMaster env, and `win_cargo` sets the local target dir + `LIBCLANG_PATH`.

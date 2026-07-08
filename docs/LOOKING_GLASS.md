@@ -76,7 +76,7 @@ optimize it or re-enable NVIDIA for QEMU/Venus only after the host-renderer corr
 For Doom/Venus performance captures, run the diagnostic launcher from the Windows desktop session:
 
 ```cmd
-C:\Users\Rupansh\helios-vgpu\tools\launch-doom-diagnostic.cmd
+C:\Users\<user>\helios-vgpu\tools\launch-doom-diagnostic.cmd
 ```
 
 It writes Helios IOCTL timing to `%USERPROFILE%\helios-doom-perf.txt` and Mesa software WSI timing to
@@ -117,8 +117,8 @@ Default behavior:
 
 ```text
 source_root: Z:\
-mirror:      C:\Users\Rupansh\helios-vgpu
-build dir:   C:\Users\Rupansh\helios-lookingglass-host-build
+mirror:      C:\Users\<user>\helios-vgpu
+build dir:   C:\Users\<user>\helios-lookingglass-host-build
 configure:   cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_NVFBC=OFF
 ```
 
@@ -131,11 +131,11 @@ The tool normalizes `source_root` before forming the absolute `icd\mesa` exclude
 `Z:\` became `Z:\\icd\mesa`, robocopy did not exclude Mesa, and the sync failed on Linux-only Mesa filenames.
 
 ```text
-robocopy Z:\ C:\Users\Rupansh\helios-vgpu /MIR /XD target .git icd\mesa Z:\icd\mesa ...
-cmake -S C:\Users\Rupansh\helios-vgpu\LookingGlass\host \
-      -B C:\Users\Rupansh\helios-lookingglass-host-build \
+robocopy Z:\ C:\Users\<user>\helios-vgpu /MIR /XD target .git icd\mesa Z:\icd\mesa ...
+cmake -S C:\Users\<user>\helios-vgpu\LookingGlass\host \
+      -B C:\Users\<user>\helios-lookingglass-host-build \
       -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_NVFBC=OFF
-cmake --build C:\Users\Rupansh\helios-lookingglass-host-build
+cmake --build C:\Users\<user>\helios-lookingglass-host-build
 ```
 
 Result:
@@ -156,15 +156,15 @@ win_looking_glass_idd {}
 
 `win_looking_glass_idd` mirrors the tree to local NTFS with robocopy, excludes `icd\mesa`, copies only
 `icd\mesa\include\vulkan` for the IDD Vulkan headers, then runs MSBuild on
-`C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\LGIdd.sln`. This avoids both WDK build I/O on `Z:\` and Windows
+`C:\Users\<user>\helios-vgpu\LookingGlass\idd\LGIdd.sln`. This avoids both WDK build I/O on `Z:\` and Windows
 reserved-name failures from the full Mesa include tree.
 
 The current IDD build completes and emits:
 
 ```text
-C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\LGIdd.dll
-C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\LGIdd.inf
-C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\lgidd.cat
+C:\Users\<user>\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\LGIdd.dll
+C:\Users\<user>\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\LGIdd.inf
+C:\Users\<user>\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\lgidd.cat
 ```
 
 ## Service-safe Vulkan ICD

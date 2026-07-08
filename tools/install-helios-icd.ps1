@@ -1,5 +1,7 @@
+# Dev-loop ICD installer (build-tree DLL -> loader registration). For the
+# packaged end-user flow use tools/package/install.ps1 instead.
 param(
-    [string]$DllPath = "C:\Users\Rupansh\helios-mesa-build\src\virtio\vulkan\vulkan_virtio.dll",
+    [string]$DllPath = "$env:USERPROFILE\helios-mesa-build\src\virtio\vulkan\vulkan_virtio.dll",
     [string]$InstallDir = "C:\ProgramData\HeliosVulkan",
     [string]$ApiVersion = "1.4.352",
     [ValidateSet("Machine", "User")]

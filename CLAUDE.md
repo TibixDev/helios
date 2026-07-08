@@ -6,7 +6,7 @@ You are the **primary author** of this project. The human overseer has OS/driver
 
 **Implementation reality (authoritative):** The KMD is a **System-class KMDF function driver** for the virtio-gpu PCI device (PCI\VEN_1AF4&DEV_1050), Setup class **System {4d36e97d-e325-11ce-bfc1-08002be10318}** — NOT a display/WDDM miniport. User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID_DEVINTERFACE_HELIOS`, discovered with SetupDiGetClassDevs + CreateFile). `kmd/build.rs` should use the KMDF/WDF path. The DOD-scoped `dispmprt.h`/`d3dkmddi.h` bindgen and `kmd/src/dxgk.rs` may remain in the repository as archived reference material, but they are not part of the active System-class build.
 
-Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See `ARCH.md` (canonical) and `docs/decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
+Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\<user>\helios-vgpu` and builds locally. See `ARCH.md` (canonical) and `docs/decisions/SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
 
 **Status (updated 2026-06-17):** The Venus stack renders end-to-end on the System-class KMDF + DeviceIoControl + Mesa Venus ICD path (`vulkaninfo`, device creation, mapped Venus memory, `vkCmdFillBuffer` readback, `vkcube`, and Doom 2016 through Venus). The WDDM Display-Only Driver pivot is **archived**. The old direct Looking Glass IDD → Helios scanout experiment is retired after black/grey output despite nonzero IDD test-pattern input. Active display work is normal Looking Glass IDD + KVMFR/ivshmem transport; the later Mesa WSI direct Looking Glass producer (`HELIOS_LG_DIRECT`, `\\.\pipe\LookingGlassIDDHelios`, and the client-side Helios overlay queue) was removed because the normal GDI DIB-shadow + BitBlt present path measures equivalently after the cache-coherency fix. The IDD capture path drops frames instead of blocking on saturated D3D12 copy queues and prefers 10 bpc on the IddCx 1.10 HDR/WCG path. The standalone launcher starts the git-built client, defaults the client to Wayland/EGL on the host default GPU, defaults KVMFR to 512 MiB, and shuts the VM down through QMP/ACPI when that client exits. The standalone launcher currently defaults QEMU/Venus to the Intel render node (`/dev/dri/renderD129`); NVIDIA is explicit (`HELIOS_QEMU_RENDER_GPU=nvidia`) and the launcher refuses it if `nvidia-smi` is already broken. **The NVIDIA Doom white-screen/crash root cause was found and fixed (2026-06-10)**: spec-violating Venus external-memory bind mismatches (vkr force-exports HOST_VISIBLE memory; buffers/images carried no matching handleTypes — VUID 02726/02728) plus WSI command pools on un-enabled queue families (VUID 01937) — UB that Intel ANV tolerates and NVIDIA does not. Fixed in `icd/mesa`; Doom 2016 now renders correctly at 120+ fps on the NVIDIA host (vs 40–45 on Intel). See docs/ICD.md for details and the performance-candidates list. NVIDIA stays opt-in until a stability soak passes; the launcher tees QEMU/render-server stderr to `/tmp/helios-qemu-stderr.log` and `HELIOS_VKR_DEBUG=validate` enables host-side validation layers in the render server (requires `vulkan-validation-layers` on the host). The Xid 13 FECS host freeze is an unfixed NVIDIA Blackwell GB202 firmware defect (open-gpu-kernel-modules#1080) — never leave a broken-rendering run sitting. The current Helios System-class device is not a WDDM/DXGI adapter, so vkd3d cannot make the IDD hardware accelerated through Helios; IDD acceleration requires either another real WDDM render adapter or a future Helios WDDM render adapter. `LookingGlass\host` still builds on Windows with the MinGW/Ninja `win_looking_glass` path, and the IDD driver builds separately with `win_looking_glass_idd`.
 
@@ -17,7 +17,7 @@ Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87
 The Linux host and the Windows VM (`win11`) **share the same source tree** (the Linux project dir is the VM's `Z:\` drive) but use different toolchains and produce incompatible artifacts. Set `CARGO_TARGET_DIR` per platform — and on Windows it MUST point at **local disk**, never the share:
 
 - **Linux:** `CARGO_TARGET_DIR=target/linux` (native Linux fs).
-- **Windows:** a **local C: path**, e.g. `CARGO_TARGET_DIR=C:\Users\Rupansh\helios-target\<crate>` — NOT `Z:\...`. Rust/cargo file IO **fails on the `Z:\` 9p/virtio share**: `OS error 87 (The parameter is incorrect)` on artifact copies, plus `could not canonicalize path Z:\`. Edit source on the share; keep the *target dir* on local C:.
+- **Windows:** a **local C: path**, e.g. `CARGO_TARGET_DIR=C:\Users\<user>\helios-target\<crate>` — NOT `Z:\...`. Rust/cargo file IO **fails on the `Z:\` 9p/virtio share**: `OS error 87 (The parameter is incorrect)` on artifact copies, plus `could not canonicalize path Z:\`. Edit source on the share; keep the *target dir* on local C:.
 
 Set this via the **`CARGO_TARGET_DIR` environment variable** on each cargo/`cargo make` invocation. Do **NOT** add `target-dir` to a committed `.cargo/config.toml` — that file is read on **both** platforms, so a Windows `C:` path would break Linux builds of shared crates (e.g. `protocol/`).
 
@@ -40,57 +40,52 @@ Set this via the **`CARGO_TARGET_DIR` environment variable** on each cargo/`carg
 ## Repository Structure
 
 ```
-helios-vgpu/
-├── CLAUDE.md              ← You are here
-├── ARCH.md                ← Canonical architecture (System-class KMDF + IOCTL + Venus) — read first
-├── README.md            ← Architecture overview
-├── docs/KMD.md                 ← Kernel-mode driver guide
-├── docs/ICD.md                 ← Vulkan ICD guide
-├── docs/TRANSPORT.md           ← VirtIO + Venus wire protocol
-├── docs/HOST.md                ← Host-side setup guide
-├── docs/TOOLCHAIN.md           ← Build environment setup
+helios/
+├── README.md              <- Front door: what Helios is, quickstart, doc map
+├── ARCH.md                <- Canonical architecture (System-class KMDF + IOCTL + Venus)
+├── CLAUDE.md              <- You are here
+├── docs/
+│   ├── KMD.md             <- Kernel-mode driver guide
+│   ├── ICD.md             <- Vulkan ICD guide (Mesa venus port; NVIDIA fix notes)
+│   ├── TRANSPORT.md       <- VirtIO + Venus wire protocol
+│   ├── HOST.md            <- Host-side setup guide
+│   ├── TOOLCHAIN.md       <- Build environment setup
+│   ├── LOOKING_GLASS.md   <- Looking Glass IDD + KVMFR display path
+│   ├── decisions/         <- Decision records (SYSTEM_CLASS_REFOCUS_2026_06_07)
+│   └── archive/           <- Historical: DOD/display pivot, phase handovers
 │
-├── kmd/                   ← Kernel-Mode Driver (Rust, KMDF/WDF)
-│   ├── Cargo.toml
-│   ├── build.rs
-│   ├── helios_kmd.inx
+├── protocol/              <- Shared no_std wire definitions (IOCTLs, virtio-gpu
+│                             structs). SINGLE SOURCE OF TRUTH, compile-asserted.
+├── kmd/                   <- Kernel-Mode Driver (Rust, KMDF via windows-drivers-rs)
 │   └── src/
-│       ├── lib.rs         ← DriverEntry, evt_device_add, IOCTL dispatch
-│       ├── adapter.rs     ← WDF device-object context (virtio + fence table)
-│       ├── ioctl.rs       ← EvtIoDeviceControl handlers (the IOCTL protocol)
-│       ├── pnp.rs         ← evt_device_add / prepare_hardware / release_hardware
-│       ├── interrupt.rs   ← WdfInterruptCreate + EvtInterruptIsr/EvtInterruptDpc
-│       └── virtio/
-│           ├── mod.rs
-│           ├── pci.rs     ← PCI capability scanning
-│           ├── queue.rs   ← Virtqueue implementation
-│           └── gpu.rs     ← virtio-gpu command structs
-│
-├── icd/                   ← Vulkan ICD (Mesa venus port over IOCTL; supersedes the hand-written tree)
-│   ├── Cargo.toml
-│   ├── src/
-│   │   ├── lib.rs         ← vk_icdGetInstanceProcAddr entry
-│   │   ├── instance.rs
-│   │   ├── device.rs
-│   │   ├── venus/
-│   │   │   ├── mod.rs
-│   │   │   ├── encode.rs  ← Venus command serialization
-│   │   │   ├── decode.rs  ← Response deserialization
-│   │   │   └── ring.rs    ← Shared-memory command ring
-│   │   └── transport.rs   ← KMD calls via DeviceIoControl on GUID_DEVINTERFACE_HELIOS
-│   └── helios_vulkan.json ← ICD manifest
-│
-└── host/                  ← Host-side Rust daemon
-    ├── Cargo.toml
-    └── src/
-        ├── main.rs
-        ├── virgl.rs       ← virglrenderer bindings
-        └── server.rs      ← Venus context management
+│       ├── lib.rs         <- DriverEntry, evt_device_add
+│       ├── pnp.rs         <- PnP/power callbacks, device interface
+│       ├── ioctl.rs       <- EvtIoDeviceControl dispatch (the IOCTL protocol)
+│       ├── adapter.rs     <- Device context (virtio + mapping/fence tables)
+│       ├── fence.rs       <- Fence table (UNWIRED - parked interrupt design)
+│       ├── interrupt.rs   <- ISR/DPC skeleton (parked; KMD is poll-mode)
+│       ├── mapping.rs     <- Per-file blob mapping table
+│       └── virtio/        <- config.rs, gpu.rs, hal.rs (virtio-drivers HAL)
+├── icd/
+│   ├── mesa/              <- Mesa fork (SUBMODULE) - venus ICD with the
+│   │                         vn_renderer_helios.c IOCTL backend
+│   └── win-build/         <- Out-of-tree Windows build scaffolding for venus
+├── probe/                 <- IOCTL smoke test EXE (run against the live KMD)
+├── host/                  <- Host-side QMP diagnostics binary
+├── tools/
+│   ├── package/           <- Driver package build + install/uninstall scripts
+│   ├── win-mcp/           <- MCP server driving the Windows dev VM over SSH
+│   └── launch-helios-gtk.sh  <- Standalone QEMU launcher
+├── LookingGlass           <- Looking Glass (SUBMODULE, optional display path)
+└── .github/workflows/     <- CI: driver package build on Windows runners
 ```
 
----
+## Implementation Order (STATUS: Phases 0-6 core goals DONE as of 2026-07-08)
 
-## Implementation Order (Follow This Exactly)
+Phases 0-5 are complete and verified on two independent setups (original dev VM;
+fresh WinBoat-evaluation rig on stock Fedora 44 QEMU/virglrenderer). Phase 6
+(DXVK/VKD3D validation) is the active frontier. The checklists below are kept
+as the canonical breakdown of what each phase meant.
 
 ### Phase 0: Toolchain (docs/TOOLCHAIN.md)
 - [ ] Set up Windows 11 dev VM with WDK (10.0.26100), VS 2022, LLVM 17

@@ -10,7 +10,7 @@
 
 ## 0. The Pivot in One Paragraph
 
-Helios is a **System-class KMDF function driver** for the virtio-gpu PCI device (PCI\VEN_1AF4&DEV_1050), Setup class **System {4d36e97d-e325-11ce-bfc1-08002be10318}** — NOT a display/WDDM miniport. There is **no dxgkrnl, no DxgkInitialize, no DRIVER_INITIALIZATION_DATA DDI table, no GPU-VA/GpuMmu/segment/monitored-fence contract, no stub D3D user-mode driver, and therefore no Code 43 and no AddAdapter capability/version handshake.** User mode reaches the KMD via **DeviceIoControl on a device interface** (`GUID_DEVINTERFACE_HELIOS`, discovered with SetupDiGetClassDevs + CreateFile). The six existing `helios_protocol` ops (CTX_CREATE, CTX_DESTROY, SUBMIT_VENUS, ALLOC_BLOB, MAP_BLOB, WAIT_FENCE) keep their exact wire layout and simply move from the D3DKMTEscape carrier to IOCTL input/output buffers. The Vulkan ICD is a Windows port of Mesa's `venus` driver whose `vn_renderer` backend talks over those IOCTLs; it is enumerated by the Windows Vulkan loader purely through `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` registry JSON (precedent: SwiftShader, Mesa lavapipe — non-WDDM ICDs that enumerate with no display adapter). The entire virtio-gpu transport, the `helios_protocol` wire crate, and the Venus host stack (virglrenderer venus + Intel ANV + egl-headless) are reused unchanged; the guest driver model is invisible to the host.
+Helios is a **System-class KMDF function driver** for the virtio-gpu PCI device (PCI\VEN_1AF4&DEV_1050), Setup class **System {4d36e97d-e325-11ce-bfc1-08002be10318}** — NOT a display/WDDM miniport. There is **no dxgkrnl, no DxgkInitialize, no DRIVER_INITIALIZATION_DATA DDI table, no GPU-VA/GpuMmu/segment/monitored-fence contract, no stub D3D user-mode driver, and therefore no Code 43 and no AddAdapter capability/version handshake.** User mode reaches the KMD via **DeviceIoControl on a device interface** (`GUID_DEVINTERFACE_HELIOS`, discovered with SetupDiGetClassDevs + CreateFile). The `helios_protocol` ops (CTX_CREATE, CTX_DESTROY, SUBMIT_VENUS, ALLOC_BLOB, MAP_BLOB, WAIT_FENCE; later joined by PRESENT_BLOB and RELEASE_BLOB) keep their exact wire layout and simply move from the D3DKMTEscape carrier to IOCTL input/output buffers. The Vulkan ICD is a Windows port of Mesa's `venus` driver whose `vn_renderer` backend talks over those IOCTLs; it is enumerated by the Windows Vulkan loader purely through `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` registry JSON (precedent: SwiftShader, Mesa lavapipe — non-WDDM ICDs that enumerate with no display adapter). The entire virtio-gpu transport, the `helios_protocol` wire crate, and the Venus host stack (virglrenderer venus + Intel ANV + egl-headless) are reused unchanged; the guest driver model is invisible to the host.
 
 ## 1. Driver Model (System-class KMDF, no WDDM)
 
@@ -43,8 +43,10 @@ Helios is a **System-class KMDF function driver** for the virtio-gpu PCI device 
 | CTX_DESTROY | IOCTL_HELIOS_CTX_DESTROY | 0x0022E404 | BUFFERED | HeliosCtxDestroy | — |
 | SUBMIT_VENUS | IOCTL_HELIOS_SUBMIT_VENUS | 0x0022E409 | IN_DIRECT | small header (ctx_id/fence_id/buffer_size) buffered + Venus blob via MDL | — |
 | ALLOC_BLOB | IOCTL_HELIOS_ALLOC_BLOB | 0x0022E40C | BUFFERED | HeliosAllocBlob (size/flags/mem/ctx) | HeliosAllocBlob (out_resource_id) |
-| MAP_BLOB | IOCTL_HELIOS_MAP_BLOB | 0x0022E412 | OUT_DIRECT | HeliosMapBlob (resource_id) | HeliosMapBlob (out_user_va) |
+| MAP_BLOB | IOCTL_HELIOS_MAP_BLOB | 0x0022E410 | BUFFERED | HeliosMapBlob (resource_id) | HeliosMapBlob (out_user_va) |
 | WAIT_FENCE | IOCTL_HELIOS_WAIT_FENCE | 0x0022E414 | BUFFERED | HeliosWaitFence (fence_id/timeout_ns) | — |
+| PRESENT_BLOB | IOCTL_HELIOS_PRESENT_BLOB | 0x0022E418 | BUFFERED | HeliosPresentBlob (resource_id) | — |
+| RELEASE_BLOB | IOCTL_HELIOS_RELEASE_BLOB | 0x0022E41C | BUFFERED | HeliosReleaseBlob (resource_id) | — |
 
 (Each value = `(0x22<<16) | (3<<14) | (fn<<2) | method`; functions 0x900–0x905; method 0/1/2/3.)
 
@@ -126,7 +128,7 @@ whether a display miniport is worth the cost.
 - The bindgen build-dependency in kmd/Cargo.toml from the active build; the WDM driver-model.
 
 **KEPT (unchanged or near-unchanged):**
-- `protocol/` crate entirely — all six op structs (escape.rs; only `out_gpa`→`out_user_va` rename, IOCTL codes + GUID added, optional header drop) and all virtio-gpu structs/constants (VIRTIO_GPU_CAPSET_VENUS=4, blob mem/flag constants).
+- `protocol/` crate entirely — all op structs (escape.rs; only `out_gpa`→`out_user_va` rename, IOCTL codes + GUID added, optional header drop) and all virtio-gpu structs/constants (VIRTIO_GPU_CAPSET_VENUS=4, blob mem/flag constants).
 - `kmd/src/virtio/{gpu.rs, hal.rs, mod.rs}` — the transport (gpu.rs `init` takes `KmdfConfigAccess`; cap scan extended for SHARED_MEMORY_CFG).
 - `kmd/src/error.rs` `DriverError` enum + `into_ntstatus` (model-agnostic).
 - `ddi/escape.rs` body — repurposed as the IOCTL handler (logic ports 1:1).
