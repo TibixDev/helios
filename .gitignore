@@ -28,3 +28,7 @@ System\ Volume\ Information
 
 # Windows share junk
 $RECYCLE.BIN/
+
+# Machine-specific MCP config (absolute binary path + per-machine Windows
+# username). Copy .mcp.json.example or use `claude mcp add`. See README.
+/.mcp.json

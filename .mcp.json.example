@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "win": {
+      "type": "stdio",
+      "command": "tools/win-mcp/target/linux/release/win-mcp",
+      "args": [],
+      "env": {
+        "HELIOS_WIN_USER": "YourWindowsUsername"
+      }
+    }
+  }
+}

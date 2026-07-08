@@ -89,6 +89,23 @@ troubleshooting.
 Submodules: `icd/mesa` is required for ICD builds (`git submodule update --init
 --depth 1 icd/mesa`); `LookingGlass` only for the Looking Glass display path.
 
+## Driving the Windows dev VM
+
+Builds and tests run inside a Windows guest, driven from Linux over SSH by the
+`tools/win-mcp` MCP server (build it with `CARGO_TARGET_DIR=target/linux cargo
+build --release` in that directory). Register it per machine — the binary path
+and Windows account are machine-specific, so `.mcp.json` is gitignored. Either
+copy [.mcp.json.example](.mcp.json.example) to `.mcp.json` and edit
+`HELIOS_WIN_USER`, or run:
+
+```
+claude mcp add win -e HELIOS_WIN_USER=<WindowsUser> -- <repo>/tools/win-mcp/target/linux/release/win-mcp
+```
+
+VM path/host overrides (`HELIOS_WIN_USER`, `HELIOS_WIN_SSH_HOST`,
+`HELIOS_WIN_MIRROR_ROOT`, `HELIOS_WIN_MESA_BUILD`, `HELIOS_WIN_MINGW_BIN`,
+`HELIOS_WIN_LG_BUILD`) are documented in [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
+
 ## Documentation
 
 Start with [ARCH.md](ARCH.md) (canonical architecture), then per subsystem:
