@@ -45,10 +45,19 @@ jobs:
         shell: pwsh
         run: |
           $kit = 'C:\Program Files (x86)\Windows Kits\10'
-          $ver = (Get-ChildItem "$kit\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
-          "Using kit $ver"
+          Get-ChildItem "$kit\Include" | Select-Object -ExpandProperty Name
+          $vers = Get-ChildItem "$kit\Include" | Where-Object Name -match '^10\.' |
+            Sort-Object { [version]$_.Name } -Descending
+          if (-not $vers) { throw "no Windows Kits versions found" }
+          $ver = $vers[0].Name
+          "Highest kit: $ver"
+          # wdk-build picks the highest kit; it must be COMPLETE (SDK headers
+          # like specstrings.h AND the km/wdf driver headers at the same version).
           if (-not (Test-Path "$kit\Include\$ver\shared\specstrings.h")) {
-            throw "incomplete WDK/SDK kit $ver (no specstrings.h) - bindgen will fail"
+            throw "kit $ver lacks SDK headers (specstrings.h) - bindgen will fail"
+          }
+          if (-not (Test-Path "$kit\Include\$ver\km\wdm.h")) {
+            throw "kit $ver lacks WDK kernel headers (km/wdm.h) - install a matching WDK"
           }
 
       - name: Build + package driver
