@@ -229,6 +229,15 @@ impl ContextTable {
         let idx = self.slots.iter().position(|s| s.owner == owner)?;
         Some(self.slots.swap_remove(idx).ctx_id)
     }
+
+    /// The file object that owns `ctx_id` (None if the context is unknown).
+    /// MAP_BLOB authorizes the caller against this.
+    fn owner_of(&self, ctx_id: u32) -> Option<usize> {
+        self.slots
+            .iter()
+            .find(|s| s.ctx_id == ctx_id)
+            .map(|s| s.owner)
+    }
 }
 
 /// One tracked blob resource. Phase 4c will add `window_offset`/`user_va`/`mdl`
@@ -314,6 +323,18 @@ impl BlobTable {
             .iter()
             .find(|s| s.resource_id == resource_id)
             .map(|s| s.size)
+    }
+
+    /// Look up a blob by `resource_id` alone, returning its owning `ctx_id` and
+    /// size. MAP_BLOB uses this to authorize the caller: the resource is mapped
+    /// only if the calling file object owns the context that owns the blob (see
+    /// [`ContextTable::owner_of`]). Resource ids are globally unique, so a single
+    /// match is unambiguous.
+    fn ctx_and_size(&self, resource_id: u32) -> Option<(u32, u64)> {
+        self.slots
+            .iter()
+            .find(|s| s.resource_id == resource_id)
+            .map(|s| (s.ctx_id, s.size))
     }
 
     /// Mark a tracked blob as mapped into the host-visible window.
@@ -1135,20 +1156,34 @@ impl VirtioGpu {
     /// command, so a rejected map does not waste window space. The caller
     /// ([`crate::ioctl`]) must ensure the resource is not already mapped (it tracks
     /// live mappings in the AdapterContext mapping table) before calling this.
+    ///
+    /// `owner` is the calling file object. The map is authorized against it: the
+    /// blob's owning context must belong to this same file object. Without this a
+    /// caller could map any client's host-visible blob (resource ids are globally
+    /// sequential) into its own address space — a cross-tenant memory-disclosure
+    /// hole once the device is reachable by more than one client. Authorizing by
+    /// the OS-enforced file object (not a caller-supplied ctx id, which could be
+    /// forged) is the robust check.
     pub fn map_blob_prepare(
         &mut self,
         resource_id: u32,
+        owner: usize,
         retired: &mut Vec<InFlight>,
     ) -> Result<BlobMapPrep, VirtioError> {
         // Drain in-flight async submits before the synchronous RESOURCE_MAP_BLOB
         // roundtrip (shared control queue; see `ctx_create`).
         self.quiesce_into(retired)?;
         let window = self.host_visible.ok_or(VirtioError::DeviceError)?;
-        // The resource must have been created (ALLOC_BLOB) so we know its size.
-        let size = self
+        // The resource must have been created (ALLOC_BLOB) so we know its owning
+        // context + size.
+        let (ctx_id, size) = self
             .blobs
-            .size_of(resource_id)
+            .ctx_and_size(resource_id)
             .ok_or(VirtioError::DeviceError)?;
+        // Authorize: the blob's context must be owned by the calling file object.
+        if self.contexts.owner_of(ctx_id) != Some(owner) {
+            return Err(VirtioError::AccessDenied);
+        }
         let map_len = round_up_page(size);
         if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
             return Err(VirtioError::DeviceError);

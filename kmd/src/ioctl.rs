@@ -513,8 +513,10 @@ unsafe fn handle_map_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTS
     // window offset; returns the guest-physical range + host caching. Quiescing
     // the control queue inside map_blob_prepare may reap in-flight submits into
     // `retired`, which drops (frees) at PASSIVE at the end of this handler.
+    let owner = file_object as usize;
     let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
-    let prep = match adapter.with_virtio(|v| v.map_blob_prepare(req.resource_id, &mut retired)) {
+    let prep = match adapter.with_virtio(|v| v.map_blob_prepare(req.resource_id, owner, &mut retired))
+    {
         Ok(Ok(p)) => p,
         Ok(Err(ve)) => return (ve.into(), 0),
         Err(de) => return (de.into(), 0),

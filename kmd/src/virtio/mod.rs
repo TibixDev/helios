@@ -21,7 +21,8 @@ pub use config::KmdfConfigAccess;
 pub use gpu::VirtioGpu;
 
 use wdk_sys::{
-    NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_IO_DEVICE_ERROR, STATUS_NOT_IMPLEMENTED,
+    NTSTATUS, STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES, STATUS_IO_DEVICE_ERROR,
+    STATUS_NOT_IMPLEMENTED,
 };
 
 /// Errors from virtio-gpu bring-up. Mapped to NTSTATUS so `StartDevice` can fail
@@ -38,6 +39,9 @@ pub enum VirtioError {
     MmioMapFailed,
     /// The device reported an error or behaved unexpectedly.
     DeviceError,
+    /// The caller is not authorized for the target resource (e.g. MAP_BLOB of a
+    /// blob owned by a different file object / context).
+    AccessDenied,
     /// Not yet implemented (scaffolding).
     NotImplemented,
 }
@@ -49,6 +53,7 @@ impl From<VirtioError> for NTSTATUS {
             VirtioError::CapNotFound | VirtioError::FeatureRejected | VirtioError::DeviceError => {
                 STATUS_IO_DEVICE_ERROR
             }
+            VirtioError::AccessDenied => STATUS_ACCESS_DENIED,
             VirtioError::NotImplemented => STATUS_NOT_IMPLEMENTED,
         }
     }

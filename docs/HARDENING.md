@@ -40,11 +40,14 @@ Sequencing rule: **H3 and H4 must be fixed before H5** — opening the device AC
   `__try/__except` shim that returns NULL on raise (makes the existing `is_null`
   branch live). Mandatory before H5.
 
-- [ ] **H4 — `MAP_BLOB` has no owner/ctx authorization** (`ioctl.rs`,
-  `virtio/gpu.rs`). Blobs are looked up by `resource_id` alone across all clients
-  (`RELEASE_BLOB` correctly checks `ctx_id` — the asymmetry confirms it). Any
-  handle could map another client's host-visible blob. Fix: add `ctx_id` to
-  `MAP_BLOB` and verify `blobs.get(ctx_id, resource_id)`. Mandatory before H5.
+- [x] ~~**H4 — `MAP_BLOB` has no owner/ctx authorization**~~ Fixed:
+  `map_blob_prepare` now authorizes by the **calling file object** — it looks up
+  the blob's owning context (`BlobTable::ctx_and_size`) and requires
+  `ContextTable::owner_of(ctx) == caller`, else `AccessDenied`. This is stronger
+  than the review's "add ctx_id to the wire" idea (a payload ctx_id could be
+  forged); authorizing by the OS-enforced file object needs no wire/ICD change.
+  Verified on the VM: the in-process ICD map path still works (`helios_vk_dev`
+  PASS: vkMapMemory round-trip + readback). (commit)
 
 - [ ] **H5 — device ACL is admin/SYSTEM only** (no SDDL, `pnp.rs`). Non-admin
   RDP-session apps get `ACCESS_DENIED`. Fix (only after H3 + H4): assign a
