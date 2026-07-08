@@ -124,6 +124,13 @@ current architecture is
   docs/archive/PHASE4E_ASYNC_HANDOVER.md section 4 for why).
 - Drivers are test-signed: guests must run with test signing enabled. Production
   signing is a future concern.
-- Known-open hardening items: non-elevated device-interface access (SDDL),
-  host-context cleanup when a client crashes, and a rare boot-time 0x7F
-  bugcheck under investigation (avoid live driver rebinds; bind at boot).
+- Hardening status (tracked in [docs/HARDENING.md](docs/HARDENING.md)): the
+  stability fixes from the 2026-07-08 kernel review have landed - the virtio
+  transport is heap-boxed (0x7F stack pressure), control-queue polls are bounded
+  so a wedged host fails the IOCTL instead of a `0x133` DPC-watchdog bugcheck, and
+  MAP_BLOB is authorized per file object. Non-admin apps can already open the
+  device (access rides the permissive default security descriptor; no SDDL is
+  needed to enable it - a future SDDL would only tighten it). Remaining: a C
+  `__try`/`__except` shim on the user-map path (an allocation failure there can
+  still bugcheck), and moving the bounded wait off the DISPATCH lock. Install and
+  boot the driver rather than live-rebinding it.

@@ -71,11 +71,16 @@ pub unsafe extern "C" fn evt_device_add(
         WDF_NO_OBJECT_ATTRIBUTES
     );
 
-    // NOTE: a device SDDL (WdfDeviceInitAssignSDDLString) for non-elevated
-    // user-mode ICD access is a Phase 5 TODO — the first attempt produced an
-    // invalid SECURITY_DESCRIPTOR (Code 31). It must be added with a SDDL
-    // validated offline (e.g. ConvertStringSecurityDescriptorToSecurityDescriptor)
-    // before going back on the device.
+    // NOTE: no explicit SDDL is assigned. The device interface rides the default
+    // security descriptor, which already grants non-elevated interactive users
+    // full open + IOCTL access (verified 2026-07-08: a limited-token, medium-IL
+    // process and a non-elevated app both open GUID_DEVINTERFACE_HELIOS and run
+    // every IOCTL). So an SDDL is NOT required to enable non-admin access. An
+    // earlier WdfDeviceInitAssignSDDLString attempt produced an invalid
+    // SECURITY_DESCRIPTOR (Code 31) and was reverted. A future SDDL would be a
+    // hardening measure to RESTRICT access (e.g. exclude low-integrity /
+    // AppContainer callers), not to enable it, and must be validated offline
+    // (ConvertStringSecurityDescriptorToSecurityDescriptor) first.
 
     // (b) Device attributes: register our typed context + a cleanup callback that
     //     frees the heap AdapterContext when the device is destroyed.
