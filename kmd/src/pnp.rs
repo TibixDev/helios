@@ -204,7 +204,9 @@ pub unsafe extern "C" fn evt_device_prepare_hardware(
     };
     match result {
         Ok(gpu) => {
-            adapter.set_virtio(Some(gpu));
+            // Box on the heap: the cell stores `Option<Box<VirtioGpu>>` so the
+            // ~2 KB transport never lives inline in the AdapterContext.
+            adapter.set_virtio(Some(alloc::boxed::Box::new(gpu)));
             kmsg(c"Helios: virtio-gpu transport up\n");
             STATUS_SUCCESS
         }

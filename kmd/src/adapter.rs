@@ -4,7 +4,7 @@
 //! device object. WDF stores a small POD [`DeviceContext`] *inline* in the
 //! device object (the typed-context mechanism); that context holds a raw pointer
 //! to a heap-`Box`ed [`AdapterContext`] which carries the real state (the virtio
-//! transport behind a spinlock, and the fence table). Using a `Box` keeps Rust
+//! transport behind a spinlock). Using a `Box` keeps Rust
 //! construction/`Drop` ordinary — WDF would otherwise hand us a zeroed blob that
 //! is unsound to interpret as a `Option<VirtioGpu>` and would never run `Drop`.
 //! The `Box` is created in `evt_device_add` and freed in the device's
@@ -22,7 +22,6 @@ use wdk_sys::{
 };
 
 use crate::error::DriverError;
-use crate::fence::FenceTable;
 use crate::mapping::MappingTable;
 use crate::virtio::VirtioGpu;
 
@@ -126,14 +125,12 @@ pub struct AdapterContext {
     /// required (same rationale as the BAR-mapping cache in `virtio::hal`).
     virtio_lock: UnsafeCell<KSPIN_LOCK>,
     /// The virtio-gpu transport, brought up in `evt_device_prepare_hardware`.
-    /// Guarded by `virtio_lock`; `None` until PrepareHardware (and after
-    /// ReleaseHardware).
-    virtio: UnsafeCell<Option<VirtioGpu>>,
-    /// fence_id → KEVENT table for the async `IOCTL_HELIOS_WAIT_FENCE` path.
-    /// Present and functional; wired to the used-ring DPC in Phase 4 (today's
-    /// submit path is synchronous, so WAIT_FENCE completes trivially).
-    #[allow(dead_code)]
-    pub fences: FenceTable,
+    /// Boxed so the ~2 KB inline `VirtQueue` lives on the heap rather than inside
+    /// this context — which is itself built as a stack temporary before being
+    /// boxed in `evt_device_add`, so an inline transport here adds ~2 KB to the
+    /// driver-load stack frame (a 0x7F kernel-stack-overflow hazard). Guarded by
+    /// `virtio_lock`; `None` until PrepareHardware (and after ReleaseHardware).
+    virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
     /// Live host-visible blob mappings (resource_id → user VA + MDL), recorded by
     /// `IOCTL_HELIOS_MAP_BLOB` and drained by `EvtFileCleanup`. Lives here (not in
     /// `virtio`) so teardown survives transport release — see [`MappingTable`].
@@ -142,9 +139,8 @@ pub struct AdapterContext {
 
 // SAFETY: `virtio` is interior-mutable but every access goes through
 // `virtio_lock` (a kernel spinlock) via `with_virtio`/`set_virtio`, so concurrent
-// IOCTL/DPC callers never alias it. `fences` is internally synchronized by its
-// own spinlock. The `Box<AdapterContext>` is shared across the device's IOCTL,
-// PnP, and interrupt callbacks via the WDF context pointer.
+// IOCTL/DPC callers never alias it. The `Box<AdapterContext>` is shared across the
+// device's IOCTL and PnP callbacks via the WDF context pointer.
 unsafe impl Send for AdapterContext {}
 unsafe impl Sync for AdapterContext {}
 
@@ -153,7 +149,6 @@ impl AdapterContext {
         Self {
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
-            fences: FenceTable::new(),
             mappings: MappingTable::new(),
         }
     }
@@ -165,7 +160,7 @@ impl AdapterContext {
     /// which are PASSIVE_LEVEL-only — they must not run at the DISPATCH_LEVEL the
     /// spinlock raises to. MUST be called at PASSIVE_LEVEL (PrepareHardware /
     /// ReleaseHardware, which the PnP manager serializes).
-    pub fn set_virtio(&self, new: Option<VirtioGpu>) {
+    pub fn set_virtio(&self, new: Option<Box<VirtioGpu>>) {
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
         // swaps the Option in/out of the cell (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
@@ -186,7 +181,8 @@ impl AdapterContext {
         // duration of the critical section.
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
         let result = match unsafe { &mut *self.virtio.get() } {
-            Some(v) => Ok(f(v)),
+            // `v: &mut Box<VirtioGpu>` → `&mut **v: &mut VirtioGpu`.
+            Some(v) => Ok(f(&mut **v)),
             None => Err(DriverError::DeviceNotFound),
         };
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };

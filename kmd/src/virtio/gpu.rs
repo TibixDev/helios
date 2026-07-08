@@ -37,6 +37,9 @@ use helios_protocol::{
     VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAP_CACHE_MASK, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
     VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
+use wdk_sys::ntddk::KeQueryPerformanceCounter;
+use wdk_sys::LARGE_INTEGER;
+
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
@@ -84,6 +87,14 @@ const BLOB_PAGE: u64 = 4096;
 /// (ioctl.rs `map_io_pages_to_user`; the load-bearing fix there is a SEH shim,
 /// pending). Generous for bring-up; bump if a real venus allocation exceeds it.
 const MAX_BLOB_MAP_BYTES: u64 = 256 << 20;
+/// Wall-clock budget for a single control-queue round-trip while polling the
+/// used ring. These polls run at DISPATCH_LEVEL under the AdapterContext
+/// spinlock, so an unbounded spin on a wedged host (e.g. the documented GB202
+/// Xid-13 FECS freeze) hangs a CPU there until Windows bugchecks 0x133
+/// (DPC_WATCHDOG). A healthy round-trip completes in microseconds; this budget
+/// is astronomically larger yet well under the watchdog, so a wedged host makes
+/// the IOCTL fail with an error instead of taking down the box.
+const HOST_POLL_BUDGET_SECS: i64 = 2;
 
 /// Round `n` up to the next [`BLOB_PAGE`] multiple (saturating).
 const fn round_up_page(n: u64) -> u64 {
@@ -975,8 +986,8 @@ impl VirtioGpu {
                         // nothing will free up. Surface rather than spin forever.
                         break Err(VirtioError::DeviceError);
                     }
-                    while !self.control.can_pop() {
-                        core::hint::spin_loop();
+                    if let Err(e) = self.wait_can_pop() {
+                        break Err(e);
                     }
                     if let Err(e) = self.drain_completed(retired) {
                         break Err(e);
@@ -1075,9 +1086,7 @@ impl VirtioGpu {
     /// PASSIVE).
     fn quiesce_into(&mut self, retired: &mut Vec<InFlight>) -> Result<(), VirtioError> {
         while !self.inflight.is_empty() {
-            while !self.control.can_pop() {
-                core::hint::spin_loop();
-            }
+            self.wait_can_pop()?;
             let before = self.inflight.len();
             self.drain_completed(retired)?;
             if self.inflight.len() == before {
@@ -1168,6 +1177,64 @@ impl VirtioGpu {
         })
     }
 
+    /// Bounded spin until the control used-ring has a completion to pop, or
+    /// [`HOST_POLL_BUDGET_SECS`] elapses. Returns `DeviceError` on expiry instead
+    /// of spinning forever at DISPATCH — a wedged host must fail the IOCTL, not
+    /// hang a CPU under the spinlock until Windows bugchecks 0x133.
+    fn wait_can_pop(&mut self) -> Result<(), VirtioError> {
+        let mut freq: LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        // SAFETY: valid out-param; KeQueryPerformanceCounter is callable at any IRQL.
+        let start = unsafe { KeQueryPerformanceCounter(&mut freq) };
+        // `freq` is ticks/second; `budget` is the deadline span in ticks.
+        // `saturating_mul` keeps a bogus/zero frequency from producing a negative
+        // budget (which would just expire immediately — still bounded, never a
+        // hang). SAFETY: LARGE_INTEGER union read.
+        let budget = unsafe { freq.QuadPart }.saturating_mul(HOST_POLL_BUDGET_SECS);
+        let start_ticks = unsafe { start.QuadPart };
+        loop {
+            if self.control.can_pop() {
+                return Ok(());
+            }
+            // SAFETY: a NULL frequency out-param is permitted.
+            let now = unsafe { KeQueryPerformanceCounter(core::ptr::null_mut()) };
+            if unsafe { now.QuadPart }.wrapping_sub(start_ticks) > budget {
+                return Err(VirtioError::DeviceError);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Add one request/response chain to the control queue, notify, wait
+    /// (bounded — see [`VirtioGpu::wait_can_pop`]) for its completion, then pop
+    /// it. The bounded replacement for `VirtQueue::add_notify_wait_pop`, whose
+    /// internal wait is an unbounded spin. Callers MUST keep the buffers behind
+    /// `inputs`/`outputs` valid and un-aliased until this returns (they are handed
+    /// to the device) — both callers pass halves of the owned scratch page.
+    fn add_wait_pop_bounded<'a>(
+        &mut self,
+        inputs: &'a [&'a [u8]],
+        outputs: &'a mut [&'a mut [u8]],
+    ) -> Result<(), VirtioError> {
+        // SAFETY: the caller guarantees the buffers outlive the round-trip, per
+        // `VirtQueue::add`'s contract; they are freed only after `pop_used` below.
+        let token = unsafe { self.control.add(inputs, outputs) }
+            .map_err(|_| VirtioError::DeviceError)?;
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+        if let Err(e) = self.wait_can_pop() {
+            // The chain is still owned by the device (never popped). We cannot
+            // safely reclaim the descriptors, but the buffers are the persistent
+            // scratch page and the transport is about to be torn down on the error
+            // path, so surfacing the error is correct.
+            return Err(e);
+        }
+        // SAFETY: same token + buffers the chain was added with.
+        unsafe { self.control.pop_used(token, inputs, outputs) }
+            .map_err(|_| VirtioError::DeviceError)?;
+        Ok(())
+    }
+
     /// Send `RESOURCE_MAP_BLOB` and return the host's `map_info` caching word from
     /// the `RESP_OK_MAP_INFO` reply. Reuses the scratch page (req low / resp high).
     fn map_blob_roundtrip(&mut self, cmd: &VirtioGpuResourceMapBlob) -> Result<u32, VirtioError> {
@@ -1187,13 +1254,9 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         req_buf[..req.len()].copy_from_slice(req);
-        self.control
-            .add_notify_wait_pop(
-                &[&req_buf[..req.len()]],
-                &mut [&mut resp_buf[..resp_len]],
-                &mut self.transport,
-            )
-            .map_err(|_| VirtioError::DeviceError)?;
+        let inputs: [&[u8]; 1] = [&req_buf[..req.len()]];
+        let mut outputs: [&mut [u8]; 1] = [&mut resp_buf[..resp_len]];
+        self.add_wait_pop_bounded(&inputs, &mut outputs)?;
         let resp: &VirtioGpuRespMapInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
         if resp_is_ok(resp.hdr.type_) {
             Ok(resp.map_info)
@@ -1221,13 +1284,9 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         req_buf[..req.len()].copy_from_slice(req);
-        self.control
-            .add_notify_wait_pop(
-                &[&req_buf[..req.len()]],
-                &mut [&mut resp_buf[..resp_len]],
-                &mut self.transport,
-            )
-            .map_err(|_| VirtioError::DeviceError)?;
+        let inputs: [&[u8]; 1] = [&req_buf[..req.len()]];
+        let mut outputs: [&mut [u8]; 1] = [&mut resp_buf[..resp_len]];
+        self.add_wait_pop_bounded(&inputs, &mut outputs)?;
         let resp: &VirtioGpuCtrlHdr = bytemuck::from_bytes(&resp_buf[..resp_len]);
         if resp_is_ok(resp.type_) {
             Ok(())

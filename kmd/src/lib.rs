@@ -32,12 +32,6 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod adapter;
 mod error;
-mod fence;
-// The WDF interrupt object (ISR/DPC + WdfInterruptCreate) is not used in
-// Phase 1–3 (the transport polls; device interrupts are suppressed). Kept for
-// Phase 4 (async fences); allow(dead_code) until then.
-#[allow(dead_code)]
-mod interrupt;
 mod ioctl;
 mod mapping;
 mod pnp;
